@@ -1,24 +1,10 @@
-name: Release
+name: 发布
 
 on:
-  push:
-    branches:
-      - main
-    tags:
-      - "v*"
-  schedule:
-    - cron: "17 2 * * *"
-  pull_request:
-    paths:
-      - .github/workflows/release.yml
-      - .github/actions/build-web/**
-      - .github/actions/download-web/**
-      - scripts/frontend-build-manifest.py
-      - scripts/setup-windows-build.ps1
   workflow_dispatch:
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || startsWith(github.ref, 'refs/tags/v') && github.ref_name || 'nightly' }}
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.ref_name }}
   cancel-in-progress: true
 
 permissions:
@@ -26,23 +12,27 @@ permissions:
 
 jobs:
   frontend:
-    name: Shared frontend and verified GeoIP
+    name: 📦 前端控制台与 GeoIP
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-node@v6
+      - name: 📥 检出代码
+        uses: actions/checkout@v5
+      - name: ⚙️ 安装 Node.js
         id: node
+        uses: actions/setup-node@v6
         with:
           node-version: 24
           cache: npm
           cache-dependency-path: web/package-lock.json
-      - name: Install locked frontend dependencies
+      - name: 📚 安装锁定版本的前端依赖
         working-directory: web
         run: npm ci
-      - uses: ./.github/actions/build-web
+      - name: 🔨 构建 Web 控制台
+        uses: ./.github/actions/build-web
         with:
           node-version: ${{ steps.node.outputs.node-version }}
-      - uses: actions/upload-artifact@v6
+      - name: ⬆️ 上传前端产物
+        uses: actions/upload-artifact@v6
         with:
           name: release-web-console
           path: |
@@ -50,217 +40,71 @@ jobs:
             target/frontend-artifact.json
           retention-days: 1
           if-no-files-found: error
-      - uses: actions/cache@v5
+      - name: 🗂️ 缓存 GeoIP 数据
+        uses: actions/cache@v5
         with:
           path: geoip/*.xdb
           key: geoip-v1-${{ hashFiles('scripts/fetch-geoip.sh') }}
-      - name: Fetch and verify GeoIP inputs
+      - name: 🗺️ 获取并校验 GeoIP
         run: bash scripts/fetch-geoip.sh
-      - uses: actions/upload-artifact@v6
+      - name: ⬆️ 上传 GeoIP 数据
+        uses: actions/upload-artifact@v6
         with:
           name: release-geoip
           path: geoip/*.xdb
           retention-days: 1
           if-no-files-found: error
 
-  client:
-    name: Client (${{ matrix.target }})
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-24.04
-            target: x86_64-unknown-linux-musl
-            archive: mirrorproxy-client-x86_64-unknown-linux-musl.tar.gz
-            deb_arch: amd64
-          - os: ubuntu-24.04
-            target: aarch64-unknown-linux-gnu
-            archive: mirrorproxy-client-aarch64-unknown-linux-gnu.tar.gz
-            deb_arch: arm64
-          - os: macos-15-intel
-            target: x86_64-apple-darwin
-            archive: mirrorproxy-client-x86_64-apple-darwin.tar.gz
-          - os: macos-15
-            target: aarch64-apple-darwin
-            archive: mirrorproxy-client-aarch64-apple-darwin.tar.gz
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-            archive: mirrorproxy-client-x86_64-pc-windows-msvc.zip
-          - os: windows-11-arm
-            target: aarch64-pc-windows-msvc
-            archive: mirrorproxy-client-aarch64-pc-windows-msvc.zip
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3, Node 24
-        with:
-          prefix-key: mirrorproxy-rust-v1
-          shared-key: ${{ runner.os }}-${{ runner.arch }}-${{ matrix.target }}-release-client
-          env-vars: CARGO CC CFLAGS CXX CMAKE RUST OPENSSL PKG_CONFIG AR
-      - name: Install musl linker
-        if: matrix.target == 'x86_64-unknown-linux-musl'
-        run: |
-          sudo apt-get update
-          sudo apt-get install --yes musl-tools
-      - name: Install ARM64 linker
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
-        run: |
-          sudo apt-get update
-          sudo apt-get install --yes gcc-aarch64-linux-gnu
-      - name: Build client
-        run: cargo build --locked --release -p mirrorproxy-cli --target ${{ matrix.target }}
-      - name: Verify Windows client
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          & "target/${{ matrix.target }}/release/mirrorproxy.exe" --version
-          if ($LASTEXITCODE -ne 0) { throw 'Client version check failed' }
-          & "target/${{ matrix.target }}/release/mirrorproxy.exe" list
-          if ($LASTEXITCODE -ne 0) { throw 'Client source catalog check failed' }
-          ./scripts/test-install-windows-powershell.ps1
-      - name: Package client
-        if: runner.os != 'Windows'
-        shell: bash
-        run: |
-          staging="mirrorproxy-client-${{ matrix.target }}"
-          mkdir "$staging"
-          cp "target/${{ matrix.target }}/release/mirrorproxy" "$staging/mirrorproxy"
-          chmod +x "$staging/mirrorproxy"
-          tar -czf "${{ matrix.archive }}" -C "$staging" mirrorproxy
-          shasum -a 256 "${{ matrix.archive }}" > "${{ matrix.archive }}.sha256"
-      - name: Package Windows client
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $archive = "${{ matrix.archive }}"
-          Compress-Archive -Path "target/${{ matrix.target }}/release/mirrorproxy.exe" -DestinationPath $archive
-          $hash = (Get-FileHash -Algorithm SHA256 $archive).Hash.ToLowerInvariant()
-          [IO.File]::WriteAllText("$archive.sha256", "$hash  $archive`n", [Text.Encoding]::ASCII)
-          $executable = "mirrorproxy-client-${{ matrix.target }}.exe"
-          Copy-Item "target/${{ matrix.target }}/release/mirrorproxy.exe" $executable
-          $hash = (Get-FileHash -Algorithm SHA256 $executable).Hash.ToLowerInvariant()
-          [IO.File]::WriteAllText("$executable.sha256", "$hash  $executable`n", [Text.Encoding]::ASCII)
-      - name: Package Debian client
-        if: matrix.deb_arch != ''
-        shell: bash
-        run: |
-          version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' crates/client/Cargo.toml | head -n1)"
-          ./scripts/package-client-deb.sh \
-            "target/${{ matrix.target }}/release/mirrorproxy" \
-            "$version" "${{ matrix.deb_arch }}" .
-          for deb in mirrorproxy_*.deb; do
-            sha256sum "$deb" >"$deb.sha256"
-          done
-      - name: Package RPM client
-        if: runner.os == 'Linux'
-        shell: bash
-        run: |
-          sudo apt-get update
-          sudo apt-get install --yes rpm
-          version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' crates/client/Cargo.toml | head -n1)"
-          bash scripts/package-client-rpm.sh \
-            "target/${{ matrix.target }}/release/mirrorproxy" \
-            "$version" "${{ matrix.deb_arch }}" .
-          for rpm in mirrorproxy-*.rpm; do
-            sha256sum "$rpm" >"$rpm.sha256"
-          done
-      - uses: actions/upload-artifact@v6
-        with:
-          name: client-${{ matrix.target }}
-          path: |
-            ${{ matrix.archive }}
-            ${{ matrix.archive }}.sha256
-            mirrorproxy_*.deb
-            mirrorproxy_*.deb.sha256
-            mirrorproxy-*.rpm
-            mirrorproxy-*.rpm.sha256
-            mirrorproxy-client-*.exe
-            mirrorproxy-client-*.exe.sha256
-          if-no-files-found: ignore
-
   server:
+    name: 🖥️ 服务端 (${{ matrix.target }})
     needs: frontend
-    name: Server (${{ matrix.target }})
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-24.04
-            target: x86_64-unknown-linux-musl
+          - target: x86_64-unknown-linux-musl
             archive: mirrorproxy-server-x86_64-unknown-linux-musl.tar.gz
-            package_arch: x86_64
-          - os: ubuntu-24.04
-            target: aarch64-unknown-linux-gnu
+          - target: aarch64-unknown-linux-gnu
             archive: mirrorproxy-server-aarch64-unknown-linux-gnu.tar.gz
-            package_arch: aarch64
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-            archive: mirrorproxy-server-x86_64-pc-windows-msvc.zip
-          - os: windows-11-arm
-            target: aarch64-pc-windows-msvc
-            archive: mirrorproxy-server-aarch64-pc-windows-msvc.zip
-    runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/cache@v5
-        if: runner.os == 'Windows'
-        with:
-          path: ${{ runner.temp }}/strawberry-perl-5.42.3.1-portable.zip
-          key: windows-perl-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/setup-windows-build.ps1') }}
-      - name: Prepare Windows OpenSSL build tools
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: ./scripts/setup-windows-build.ps1
-      - uses: dtolnay/rust-toolchain@stable
+      - name: 📥 检出代码
+        uses: actions/checkout@v5
+      - name: 🦀 安装 Rust 工具链
+        uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3, Node 24
+      - name: 🗂️ 缓存 Rust 构建
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3, Node 24
         with:
           prefix-key: mirrorproxy-rust-v1
           shared-key: ${{ runner.os }}-${{ runner.arch }}-${{ matrix.target }}-release-server
           env-vars: CARGO CC CFLAGS CXX CMAKE RUST OPENSSL PKG_CONFIG AR
-      - uses: actions/setup-python@v6
-        if: runner.os == 'Windows'
-        with:
-          python-version: '3.13'
-      - uses: ./.github/actions/download-web
+      - name: ⬇️ 下载前端产物
+        uses: ./.github/actions/download-web
         with:
           name: release-web-console
-      - uses: actions/download-artifact@v8
+      - name: ⬇️ 下载 GeoIP 数据
+        uses: actions/download-artifact@v8
         with:
           name: release-geoip
           path: geoip
-      - name: Install musl linker
+      - name: 🔧 安装 musl 链接器
         if: matrix.target == 'x86_64-unknown-linux-musl'
         run: |
           sudo apt-get update
           sudo apt-get install --yes musl-tools
-      - name: Install ARM64 linker
+      - name: 🔧 安装 ARM64 链接器
         if: matrix.target == 'aarch64-unknown-linux-gnu'
         run: |
           sudo apt-get update
           sudo apt-get install --yes gcc-aarch64-linux-gnu
-      - name: Build server
-        if: runner.os != 'Windows'
-        shell: bash
+      - name: 🔨 构建服务端
         run: |
           GIT_COMMIT="${GITHUB_SHA}" \
           BUILD_TIME="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
           cargo build --locked --release -p mirrorproxy-server --target ${{ matrix.target }}
-      - name: Build Windows server
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $env:GIT_COMMIT = $env:GITHUB_SHA
-          $env:BUILD_TIME = [DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ')
-          cargo build --locked --release -p mirrorproxy-server --target ${{ matrix.target }}
-          if ($LASTEXITCODE -ne 0) { throw 'Windows server build failed' }
-      - name: Package server
-        if: runner.os != 'Windows'
-        shell: bash
+      - name: 📦 打包服务端归档
         run: |
           staging="mirrorproxy-server-${{ matrix.target }}"
           mkdir "$staging"
@@ -269,145 +113,39 @@ jobs:
           cp -R geoip "$staging/geoip"
           chmod +x "$staging/mirrorproxy-server"
           tar -czf "${{ matrix.archive }}" -C "$staging" mirrorproxy-server config.example.toml geoip
-          shasum -a 256 "${{ matrix.archive }}" > "${{ matrix.archive }}.sha256"
-      - name: Package and verify Windows server
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $staging = "mirrorproxy-server-${{ matrix.target }}"
-          New-Item -ItemType Directory -Path $staging | Out-Null
-          Copy-Item "target/${{ matrix.target }}/release/mirrorproxy-server.exe" "$staging/mirrorproxy-server.exe"
-          Copy-Item config.example.toml $staging
-          Copy-Item -Recurse geoip $staging
-          $archive = "${{ matrix.archive }}"
-          Compress-Archive -Path "$staging/*" -DestinationPath $archive
-          $hash = (Get-FileHash -Algorithm SHA256 $archive).Hash.ToLowerInvariant()
-          [IO.File]::WriteAllText("$archive.sha256", "$hash  $archive`n", [Text.Encoding]::ASCII)
-          Expand-Archive -Path $archive -DestinationPath verified-server
-          & ./verified-server/mirrorproxy-server.exe --version
-          if ($LASTEXITCODE -ne 0) { throw 'Server version check failed' }
-          python scripts/smoke-source-details.py verified-server/mirrorproxy-server.exe
-          if ($LASTEXITCODE -ne 0) { throw 'Packaged server protocol smoke failed' }
-      - name: Build native Linux packages
-        if: runner.os == 'Linux'
-        shell: bash
-        run: |
-          sudo apt-get update
-          sudo apt-get install --yes rpm
-          version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' crates/server/Cargo.toml | head -n1)"
-          ./scripts/package-linux.sh \
-            "target/${{ matrix.target }}/release/mirrorproxy-server" \
-            "$version" "${{ matrix.package_arch }}" .
-          for package in mirrorproxy-server_*.deb mirrorproxy-server-*.rpm; do
-            sha256sum "$package" >"$package.sha256"
-          done
-      - uses: actions/upload-artifact@v6
+          shasum -a 256 "${{ matrix.archive }}" >"${{ matrix.archive }}.sha256"
+      - name: ⬆️ 上传服务端产物
+        uses: actions/upload-artifact@v6
         with:
           name: server-${{ matrix.target }}
           path: |
             ${{ matrix.archive }}
             ${{ matrix.archive }}.sha256
-            mirrorproxy-server_*.deb
-            mirrorproxy-server-*.rpm
-            mirrorproxy-server_*.deb.sha256
-            mirrorproxy-server-*.rpm.sha256
+          if-no-files-found: error
 
   publish:
-    needs: [client, server]
-    if: github.event_name != 'pull_request'
+    name: 🚀 发布 GitHub Release
+    needs: server
+    if: ${{ startsWith(github.ref, 'refs/tags/v') }}
     permissions:
       contents: write
-      pages: write
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/download-artifact@v8
-        with:
-          pattern: client-*
-          path: release-artifacts
-      - uses: actions/download-artifact@v8
+      - name: 📥 检出代码
+        uses: actions/checkout@v5
+      - name: ⬇️ 下载服务端产物
+        uses: actions/download-artifact@v8
         with:
           pattern: server-*
           path: release-artifacts
-      - name: Validate stable distribution credentials
-        if: ${{ startsWith(github.ref, 'refs/tags/v') }}
+      - name: 🧾 汇总 SHA256SUMS
+        run: |
+          find release-artifacts -name '*.sha256' -print0 | sort -z | xargs -0 cat >SHA256SUMS
+      - name: 📝 生成发布说明
         env:
-          APT_GPG_PRIVATE_KEY: ${{ secrets.APT_GPG_PRIVATE_KEY }}
-          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
-        run: |
-          test -n "$APT_GPG_PRIVATE_KEY" || { echo "::error title=APT signing key required::Add APT_GPG_PRIVATE_KEY to the repository Actions secrets."; exit 1; }
-          test -n "$HOMEBREW_TAP_TOKEN" || { echo "::error title=Homebrew tap token required::Add HOMEBREW_TAP_TOKEN to the repository Actions secrets."; exit 1; }
-      - name: Assemble checksums
-        run: |
-          find release-artifacts -name '*.sha256' -print0 | sort -z | xargs -0 cat > SHA256SUMS
-      - name: Generate client package manifests
-        if: ${{ startsWith(github.ref, 'refs/tags/v') }}
-        run: |
-          mkdir package-manifests
-          ./scripts/generate-package-manifests.sh "${GITHUB_REF_NAME#v}" release-artifacts package-manifests
-          ruby -c package-manifests/mirrorproxy.rb
-          python3 -m json.tool package-manifests/mirrorproxy.json >/dev/null
-          (cd package-manifests/winget && zip -qr ../../mirrorproxy-winget-manifests.zip manifests)
-          sha256sum mirrorproxy-winget-manifests.zip >>SHA256SUMS
-      - name: Build signed APT repository
-        if: ${{ startsWith(github.ref, 'refs/tags/v') }}
-        env:
-          APT_GPG_PRIVATE_KEY: ${{ secrets.APT_GPG_PRIVATE_KEY }}
-          APT_GPG_PASSPHRASE: ${{ secrets.APT_GPG_PASSPHRASE }}
-        run: |
-          sudo apt-get update
-          sudo apt-get install --yes apt-utils dpkg-dev gnupg
-          ./scripts/generate-apt-repository.sh release-artifacts apt-repository stable
-          tar -czf mirrorproxy-apt-repository.tar.gz -C apt-repository .
-          sha256sum mirrorproxy-apt-repository.tar.gz >>SHA256SUMS
-      - name: Publish client APT repository branch
-        if: ${{ startsWith(github.ref, 'refs/tags/v') }}
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          git -C apt-repository init -b apt
-          git -C apt-repository config user.name github-actions[bot]
-          git -C apt-repository config user.email 41898282+github-actions[bot]@users.noreply.github.com
-          git -C apt-repository add --all
-          git -C apt-repository commit -m "apt: publish ${GITHUB_REF_NAME}"
-          git -C apt-repository remote add origin "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
-          git -C apt-repository push --force origin HEAD:refs/heads/apt
-      - name: Prepare Homebrew tap checkout
-        if: ${{ startsWith(github.ref, 'refs/tags/v') }}
-        uses: actions/checkout@v5
-        with:
-          repository: ${{ github.repository_owner }}/homebrew-tap
-          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
-          path: homebrew-tap
-      - name: Move rolling Nightly tag
-        if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
-        uses: actions/github-script@v8
-        with:
-          script: |
-            const { owner, repo } = context.repo;
-            try {
-              await github.rest.git.updateRef({
-                owner,
-                repo,
-                ref: "tags/nightly",
-                sha: context.sha,
-                force: true,
-              });
-            } catch (error) {
-              if (error.status !== 404 && error.status !== 422) throw error;
-              await github.rest.git.createRef({
-                owner,
-                repo,
-                ref: "refs/tags/nightly",
-                sha: context.sha,
-              });
-            }
-      - name: Generate release download tables
-        env:
-          RELEASE_TAG: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || 'nightly' }}
+          RELEASE_TAG: ${{ github.ref_name }}
         run: python3 scripts/generate-release-body.py release-artifacts "$GITHUB_REPOSITORY" "$RELEASE_TAG" release-body.md
-      - name: Publish versioned release
-        if: ${{ startsWith(github.ref, 'refs/tags/v') }}
+      - name: 🚀 发布版本
         uses: softprops/action-gh-release@v3
         with:
           name: ${{ github.ref_name }}
@@ -417,68 +155,3 @@ jobs:
           files: |
             release-artifacts/**/*
             SHA256SUMS
-            scripts/install.sh
-            scripts/install.ps1
-            package-manifests/mirrorproxy.rb
-            package-manifests/mirrorproxy.json
-            package-manifests/winget/**/*
-            mirrorproxy-winget-manifests.zip
-            mirrorproxy-apt-repository.tar.gz
-            apt-repository/mirrorproxy-archive-keyring.asc
-      - name: Publish Homebrew formula
-        if: ${{ startsWith(github.ref, 'refs/tags/v') }}
-        shell: bash
-        run: |
-          mkdir -p homebrew-tap/Formula
-          cp package-manifests/mirrorproxy.rb homebrew-tap/Formula/mirrorproxy.rb
-          cd homebrew-tap
-          git config user.name github-actions[bot]
-          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
-          git add Formula/mirrorproxy.rb
-          git commit -m "mirrorproxy ${GITHUB_REF_NAME#v}"
-          git push
-      - name: Publish rolling Nightly
-        if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
-        uses: softprops/action-gh-release@v3
-        with:
-          tag_name: nightly
-          name: Nightly
-          body_path: release-body.md
-          prerelease: true
-          make_latest: false
-          overwrite_files: true
-          fail_on_unmatched_files: true
-          files: |
-            release-artifacts/**/*
-            SHA256SUMS
-            scripts/install.sh
-            scripts/install.ps1
-
-  submit-winget:
-    name: Submit WinGet update
-    if: ${{ startsWith(github.ref, 'refs/tags/v') && vars.WINGET_AUTO_SUBMIT == 'true' }}
-    needs: publish
-    runs-on: windows-latest
-    steps:
-      - name: Require WinGet submission token
-        shell: pwsh
-        env:
-          WINGET_TOKEN: ${{ secrets.WINGET_TOKEN }}
-        run: |
-          if ([string]::IsNullOrWhiteSpace($env:WINGET_TOKEN)) {
-            throw 'WINGET_TOKEN is required when WINGET_AUTO_SUBMIT=true'
-          }
-      - name: Install WinGetCreate
-        shell: pwsh
-        run: Invoke-WebRequest https://aka.ms/wingetcreate/latest -OutFile wingetcreate.exe
-      - name: Submit multi-architecture package manifests
-        shell: pwsh
-        env:
-          WINGET_TOKEN: ${{ secrets.WINGET_TOKEN }}
-        run: |
-          $version = "${{ github.ref_name }}".TrimStart('v')
-          $url = "https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/mirrorproxy-winget-manifests.zip"
-          Invoke-WebRequest $url -OutFile winget-manifests.zip
-          Expand-Archive winget-manifests.zip -DestinationPath winget-manifests
-          .\wingetcreate.exe submit --no-open --token $env:WINGET_TOKEN "winget-manifests/manifests/i/Inbjo/MirrorProxy/$version"
-          if ($LASTEXITCODE -ne 0) { throw 'WinGet manifest submission failed' }
