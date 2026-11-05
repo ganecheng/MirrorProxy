@@ -102,6 +102,26 @@ smoke_curl() {
     "$1"
 }
 
+# pub metadata must point archives back at this mirror, and the rewritten URL
+# must actually serve the tarball through the proxy.
+smoke_pub_archive() {
+  local metadata="${work}/pub-metadata.json"
+  local archive
+
+  curl --fail --silent --show-error --retry 3 --retry-all-errors \
+    --output "${metadata}" "${base}/pub/api/packages/http"
+  archive="$(python3 -c 'import json,sys
+print(json.load(open(sys.argv[1]))["latest"]["archive_url"])' "${metadata}")"
+  case "${archive}" in
+    "${base}/pub/upstream/"*) ;;
+    *)
+      printf 'pub metadata does not proxy archives through the mirror: %s\n' "${archive}" >&2
+      return 1
+      ;;
+  esac
+  smoke_curl "${archive}"
+}
+
 smoke_public_oci_image() {
   local name="$1"
   local repository="$2"
@@ -313,7 +333,7 @@ if [[ "${MIRRORPROXY_SMOKE_EXTENDED:-0}" == "1" ]]; then
   smoke_curl "${base}/rustup/dist/channel-rust-stable.toml"
   smoke_curl "${base}/julia/registries"
   smoke_curl "${base}/cocoapods/all_pods_versions_2_0_0.txt"
-  smoke_curl "${base}/pub/api/packages/http"
+  smoke_pub_archive
   smoke_curl "${base}/anaconda/main/noarch/repodata.json"
   smoke_curl "${base}/texlive/tlpkg/texlive.tlpdb"
   smoke_curl "${base}/elpa/archive-contents"
