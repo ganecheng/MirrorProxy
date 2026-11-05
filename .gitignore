@@ -19,3 +19,6 @@ mirrorproxy.sqlite3-wal
 /web/.umi-production/
 
 /web/build/no-node-crypto/node_modules/
+
+.idea
+.qwen
