@@ -1813,6 +1813,41 @@ fn route_groups_never_include_request_paths_or_queries() {
     assert_eq!(route_group_for_path("/unknown/token-value"), "/static");
 }
 
+#[test]
+fn cache_outcomes_are_bounded_and_use_only_response_metadata() {
+    let headers = HeaderMap::new();
+    assert_eq!(cache_outcome_for("GET", &headers, StatusCode::OK), "miss");
+    assert_eq!(cache_outcome_for("POST", &headers, StatusCode::OK), "bypass");
+
+    let cached = |value: &'static str, status: StatusCode| {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-mirrorproxy-cache", HeaderValue::from_static(value));
+        cache_outcome_for("GET", &headers, status)
+    };
+    assert_eq!(cached("HIT", StatusCode::OK), "hit");
+    assert_eq!(cached("HIT", StatusCode::NOT_FOUND), "negative_hit");
+    assert_eq!(cached("REVALIDATED", StatusCode::OK), "revalidated");
+    assert_eq!(cached("BYPASS", StatusCode::OK), "bypass");
+}
+
+#[test]
+fn logged_request_paths_stay_bounded_and_keep_queries_out() {
+    assert_eq!(
+        bounded_request_path("/proxy/maven/org/example/a.jar"),
+        "/proxy/maven/org/example/a.jar"
+    );
+
+    let long_path = format!("/proxy/maven/{}", "a".repeat(LOGGED_PATH_MAX_CHARS + 40));
+    let bounded = bounded_request_path(&long_path);
+    assert_eq!(bounded.chars().count(), LOGGED_PATH_MAX_CHARS + 1);
+    assert!(bounded.ends_with('…'));
+
+    let uri: axum::http::Uri = "/proxy/npm/@scope/name?token=secret".parse().unwrap();
+    let path = bounded_request_path(uri.path());
+    assert_eq!(path, "/proxy/npm/@scope/name");
+    assert!(!path.contains("secret"));
+}
+
 #[tokio::test]
 async fn rate_limit_returns_too_many_requests() {
     let app = build_router(Config {

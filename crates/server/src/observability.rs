@@ -11,6 +11,7 @@ pub struct Observability {
     http_duration: HistogramVec,
     proxy_response_bytes: IntCounterVec,
     proxy_stream_errors: IntCounterVec,
+    cache_events: IntCounterVec,
     rejections: IntCounterVec,
     geoip_lookups: IntCounterVec,
 }
@@ -56,6 +57,13 @@ impl Observability {
             ),
             &["reason"],
         )?;
+        let cache_events = IntCounterVec::new(
+            Opts::new(
+                "mirrorproxy_cache_events_total",
+                "Proxy requests grouped by normalized route and cache outcome.",
+            ),
+            &["route", "result"],
+        )?;
         let geoip_lookups = IntCounterVec::new(
             Opts::new(
                 "mirrorproxy_geoip_lookups_total",
@@ -81,6 +89,7 @@ impl Observability {
         registry.register(Box::new(http_duration.clone()))?;
         registry.register(Box::new(proxy_response_bytes.clone()))?;
         registry.register(Box::new(proxy_stream_errors.clone()))?;
+        registry.register(Box::new(cache_events.clone()))?;
         registry.register(Box::new(rejections.clone()))?;
         registry.register(Box::new(geoip_lookups.clone()))?;
         registry.register(Box::new(build_info))?;
@@ -91,6 +100,7 @@ impl Observability {
             http_duration,
             proxy_response_bytes,
             proxy_stream_errors,
+            cache_events,
             rejections,
             geoip_lookups,
         })
@@ -118,6 +128,10 @@ impl Observability {
         self.rejections.with_label_values(&[reason]).inc();
     }
 
+    pub fn observe_cache(&self, route: &str, result: &str) {
+        self.cache_events.with_label_values(&[route, result]).inc();
+    }
+
     pub fn observe_geoip_lookup(&self, ip_version: &str, found: bool) {
         self.geoip_lookups
             .with_label_values(&[ip_version, if found { "found" } else { "unknown" }])
@@ -142,6 +156,7 @@ mod tests {
         metrics.observe_http("GET", "/proxy/maven", 200, Duration::from_millis(25));
         metrics.observe_proxy_body("maven", 200, 42, false);
         metrics.observe_rejection("monthly_quota");
+        metrics.observe_cache("/proxy/maven", "hit");
 
         let (_, output) = metrics.encode().unwrap();
         let output = String::from_utf8(output).unwrap();
@@ -152,6 +167,9 @@ mod tests {
             "mirrorproxy_proxy_response_bytes_total{status=\"200\",target=\"maven\"} 42"
         ));
         assert!(output.contains("mirrorproxy_rejections_total{reason=\"monthly_quota\"} 1"));
+        assert!(output.contains(
+            "mirrorproxy_cache_events_total{result=\"hit\",route=\"/proxy/maven\"} 1"
+        ));
         assert!(!output.contains("authorization"));
         assert!(!output.contains("token="));
     }

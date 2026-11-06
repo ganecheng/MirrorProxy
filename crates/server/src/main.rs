@@ -3004,6 +3004,7 @@ async fn observability_middleware(
     let method = request.method().as_str().to_string();
     let target = proxy_target_for_path(request.uri().path()).unwrap_or("none");
     let route = route_group_for_path(request.uri().path());
+    let path = bounded_request_path(request.uri().path()).into_owned();
     let parent_context = opentelemetry::global::get_text_map_propagator(|propagator| {
         propagator.extract(&HeaderExtractor(request.headers()))
     });
@@ -3011,6 +3012,7 @@ async fn observability_middleware(
         "http.server.request",
         http_method = %method,
         http_route = %route,
+        mirrorproxy_path = %path,
         http_status_code = tracing::field::Empty,
         mirrorproxy_target = %target,
     );
@@ -3022,15 +3024,65 @@ async fn observability_middleware(
         let response = next.run(request).await;
         let status = response.status().as_u16();
         let elapsed = started.elapsed();
+        let cache = if target == "none" {
+            "n/a"
+        } else {
+            cache_outcome_for(&method, response.headers(), response.status())
+        };
         tracing::Span::current().record("http_status_code", status);
         state
             .observability
             .observe_http(&method, &route, status, elapsed);
-        tracing::info!(duration_ms = elapsed.as_millis(), "HTTP request completed");
+        if cache != "n/a" {
+            state.observability.observe_cache(&route, cache);
+        }
+        tracing::info!(
+            duration_ms = elapsed.as_millis(),
+            cache = %cache,
+            "HTTP request completed"
+        );
+        if elapsed >= Duration::from_secs(1) {
+            tracing::warn!(
+                duration_ms = elapsed.as_millis(),
+                cache = %cache,
+                "slow request; inspect the upstream failover lines for this path"
+            );
+        }
         response
     }
     .instrument(span)
     .await
+}
+
+/// Keeps the proxied coordinates, which are what an operator needs to explain a
+/// slow or uncached artifact, while bounding user-controlled input.
+const LOGGED_PATH_MAX_CHARS: usize = 512;
+
+fn bounded_request_path(path: &str) -> std::borrow::Cow<'_, str> {
+    if path.chars().count() <= LOGGED_PATH_MAX_CHARS {
+        return std::borrow::Cow::Borrowed(path);
+    }
+    let mut bounded: String = path.chars().take(LOGGED_PATH_MAX_CHARS).collect();
+    bounded.push('…');
+    std::borrow::Cow::Owned(bounded)
+}
+
+/// Classifies how a proxy response was produced. `BYPASS` marks adapters that
+/// deliberately never cache, such as Hugging Face large-file streaming.
+fn cache_outcome_for(method: &str, headers: &HeaderMap, status: StatusCode) -> &'static str {
+    if !matches!(method, "GET" | "HEAD") {
+        return "bypass";
+    }
+    match headers
+        .get("x-mirrorproxy-cache")
+        .and_then(|value| value.to_str().ok())
+    {
+        Some("HIT") if status == StatusCode::NOT_FOUND => "negative_hit",
+        Some("HIT") => "hit",
+        Some("REVALIDATED") => "revalidated",
+        Some("BYPASS") => "bypass",
+        _ => "miss",
+    }
 }
 
 fn route_group_for_path(path: &str) -> String {
