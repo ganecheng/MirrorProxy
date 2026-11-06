@@ -19,6 +19,11 @@ follow semantic versioning.
   credentials; retain named authentication for existing security keys and
   request discoverable credentials preferentially on new registrations.
 
+- Point pub `archive_url` values that upstream metadata still advertises at the
+  retired `storage.flutter-io.cn` bucket to the mirror endpoint that serves the
+  same file, so `pub get` stops reporting `could not find package` for healthy
+  packages.
+
 ## [1.7.2] - 2026-11-02
 
 ### Release packages

@@ -19,6 +19,25 @@ const ARCHIVE_HOSTS: &[&str] = &[
     "storage.googleapis.com",
 ];
 
+/// A layout some upstream metadata still advertises although the origin stopped
+/// serving it, paired with the endpoint that still serves the same file.
+/// `pub.flutter-io.cn` keeps pointing `versions[].archive_url` at the retired
+/// `dartlang-pub-public-packages` bucket, which answers 404 for every package,
+/// while the archive is available from the mirror's `api/archives/` entry point.
+struct RetiredArchiveLayout {
+    host: &'static str,
+    prefix: &'static str,
+    live_host: &'static str,
+    live_prefix: &'static str,
+}
+
+const RETIRED_ARCHIVE_LAYOUTS: &[RetiredArchiveLayout] = &[RetiredArchiveLayout {
+    host: "storage.flutter-io.cn",
+    prefix: "dartlang-pub-public-packages/packages/",
+    live_host: "pub.flutter-io.cn",
+    live_prefix: "api/archives/",
+}];
+
 /// pub serves package metadata as JSON from `/api/...`; `/api/archives/` is the
 /// only binary endpoint and must stay on the streaming, cacheable path instead
 /// of being buffered for URL rewriting.
@@ -97,6 +116,21 @@ fn sanitize(path: &str) -> Result<String, ProxyError> {
     }
     Ok(path.to_string())
 }
+/// Maps a retired archive layout onto the endpoint that still serves the file.
+/// Anything else keeps its own origin, so an unexpected upstream layout is
+/// proxied as advertised instead of being guessed at.
+fn live_archive_target(host: &str, path: &str) -> (String, String) {
+    for layout in RETIRED_ARCHIVE_LAYOUTS {
+        let Some(file) = path.strip_prefix(layout.prefix) else {
+            continue;
+        };
+        if host != layout.host || file.is_empty() || file.contains('/') {
+            continue;
+        }
+        return (layout.live_host.to_string(), format!("{}{file}", layout.live_prefix));
+    }
+    (host.to_string(), path.to_string())
+}
 /// Resolves `/pub/upstream/<host>/<path>` back to the archive origin. Every
 /// other path returns `Ok(None)` so normal upstream routing takes over.
 fn archive_upstream_url(
@@ -110,6 +144,7 @@ fn archive_upstream_url(
     if !ARCHIVE_HOSTS.contains(&host) {
         return Err(ProxyError::InvalidUrl);
     }
+    let (host, upstream_path) = live_archive_target(host, upstream_path);
     let mut url = reqwest::Url::parse(&format!("https://{host}/{upstream_path}"))
         .map_err(|_| ProxyError::InvalidUrl)?;
     url.set_query(query);
@@ -164,6 +199,7 @@ fn proxied_archive_url(url: &str, base: &str) -> Option<String> {
     if sanitize(upstream_path).is_err() {
         return None;
     }
+    let (host, upstream_path) = live_archive_target(host, upstream_path);
     let mut proxied = format!("{base}/pub/upstream/{host}/{upstream_path}");
     if let Some(query) = query {
         proxied.push('?');
@@ -243,6 +279,40 @@ mod tests {
             .expect("supported host")
             .expect("archive route");
         assert_eq!(url.as_str(), "https://pub.dev/api/archives/http-1.6.0.tar.gz");
+    }
+    #[test]
+    fn rewrites_retired_mirror_bucket_to_the_live_endpoint() {
+        let retired =
+            "https://storage.flutter-io.cn/dartlang-pub-public-packages/packages/http-1.6.tar.gz";
+        let mut value = serde_json::json!({"archive_url": retired});
+        rewrite_archive_urls(&mut value, "https://mirror.example");
+        assert_eq!(
+            value["archive_url"],
+            "https://mirror.example/pub/upstream/pub.flutter-io.cn/api/archives/http-1.6.tar.gz"
+        );
+    }
+    #[test]
+    fn serves_retired_bucket_paths_from_the_live_endpoint() {
+        let path =
+            "upstream/storage.flutter-io.cn/dartlang-pub-public-packages/packages/http-1.6.tar.gz";
+        let url = archive_upstream_url(path, None)
+            .expect("supported host")
+            .expect("archive route");
+        assert_eq!(url.host_str(), Some("pub.flutter-io.cn"));
+        assert_eq!(url.path(), "/api/archives/http-1.6.tar.gz");
+    }
+    #[test]
+    fn keeps_other_mirror_layouts_on_their_own_origin() {
+        let url = archive_upstream_url("upstream/storage.flutter-io.cn/packages/http.tar.gz", None)
+            .expect("supported host")
+            .expect("archive route");
+        assert_eq!(url.host_str(), Some("storage.flutter-io.cn"));
+    }
+    #[test]
+    fn retired_archive_targets_stay_inside_the_allowlist() {
+        for layout in RETIRED_ARCHIVE_LAYOUTS {
+            assert!(ARCHIVE_HOSTS.contains(&layout.live_host));
+        }
     }
     #[test]
     fn rejects_archive_hosts_outside_the_allowlist() {
