@@ -67,6 +67,18 @@ pub(super) struct DiskCacheMetadata {
     pub(super) expires_at: u64,
     #[serde(default)]
     pub(super) vary: Vec<(String, String)>,
+    /// A HEAD answer carries no body, so it may only satisfy another HEAD request.
+    #[serde(default)]
+    pub(super) head_only: bool,
+}
+
+/// Explicit cache write policy for answers that are not a plain GET success.
+#[derive(Clone, Copy, Default)]
+pub(super) struct DiskCacheWriteOptions {
+    /// Persist a body-less HEAD answer; it never replaces a cached response body.
+    pub(super) head_only: bool,
+    /// Replaces upstream freshness, for example a negative or HEAD lifetime.
+    pub(super) ttl_secs: Option<u64>,
 }
 
 pub(super) struct DiskCacheEntry {
@@ -86,6 +98,29 @@ pub(super) fn cache_paths(cache: &CacheConfig, url: &Url) -> Option<(PathBuf, Pa
     ))
 }
 
+/// Metadata-only probe, so a cache hit can be located across every configured
+/// upstream before any body is allocated.
+pub(super) fn load_disk_cache_metadata(
+    cache: &CacheConfig,
+    url: &Url,
+    incoming_headers: &HeaderMap,
+) -> Option<DiskCacheMetadata> {
+    let (_, metadata_path) = cache_paths(cache, url)?;
+    let metadata: DiskCacheMetadata =
+        serde_json::from_slice(&fs::read(metadata_path).ok()?).ok()?;
+    vary_matches(&metadata, incoming_headers).then_some(metadata)
+}
+
+fn vary_matches(metadata: &DiskCacheMetadata, incoming_headers: &HeaderMap) -> bool {
+    !metadata.vary.iter().any(|(name, expected)| {
+        incoming_headers
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            != expected
+    })
+}
+
 pub(super) fn load_disk_cache(
     cache: &CacheConfig,
     url: &Url,
@@ -94,13 +129,7 @@ pub(super) fn load_disk_cache(
     let (body_path, metadata_path) = cache_paths(cache, url)?;
     let metadata: DiskCacheMetadata =
         serde_json::from_slice(&fs::read(metadata_path).ok()?).ok()?;
-    if metadata.vary.iter().any(|(name, expected)| {
-        incoming_headers
-            .get(name)
-            .and_then(|value| value.to_str().ok())
-            .unwrap_or_default()
-            != expected
-    }) {
+    if !vary_matches(&metadata, incoming_headers) {
         return None;
     }
     // Avoid allocating the body for mismatched variants, and reject oversized files.
@@ -113,6 +142,11 @@ pub(super) fn load_disk_cache(
         .open(&body_path)
         .and_then(|file| file.set_modified(SystemTime::now()));
     Some(DiskCacheEntry { body, metadata })
+}
+
+/// A HEAD-only entry holds no body, so it may only answer another HEAD request.
+pub(super) fn cache_entry_serves(entry: &DiskCacheEntry, method: &Method) -> bool {
+    !entry.metadata.head_only || *method == Method::HEAD
 }
 
 pub(super) fn cached_response(
@@ -144,6 +178,7 @@ pub(super) fn write_disk_cache(
     status: reqwest::StatusCode,
     headers: &HeaderMap,
     body: &[u8],
+    options: DiskCacheWriteOptions,
 ) {
     let Some((body_path, metadata_path)) = cache_paths(cache, url) else {
         return;
@@ -154,10 +189,23 @@ pub(super) fn write_disk_cache(
     if fs::create_dir_all(parent).is_err() {
         return;
     }
-    let Some((stored_at, expires_at)) = cache_lifetime(cache, headers) else {
+    let lifetime = match options.ttl_secs {
+        Some(ttl_secs) => explicit_cache_lifetime(cache, ttl_secs),
+        None => cache_lifetime(cache, headers),
+    };
+    let Some((stored_at, expires_at)) = lifetime else {
         return;
     };
     if headers.contains_key(header::SET_COOKIE) {
+        return;
+    }
+    // A body-less HEAD answer must never replace a cached response body.
+    if options.head_only
+        && fs::read(&metadata_path)
+            .ok()
+            .and_then(|value| serde_json::from_slice::<DiskCacheMetadata>(&value).ok())
+            .is_some_and(|existing| !existing.head_only)
+    {
         return;
     }
     let Some(vary) = cache_vary(headers, incoming_headers) else {
@@ -168,6 +216,12 @@ pub(super) fn write_disk_cache(
         headers: headers
             .iter()
             .filter(|(name, _)| should_forward_response_header(name))
+            // A negative answer is replayed without the upstream body, so
+            // body-specific headers must not describe the cached empty body.
+            .filter(|(name, _)| {
+                status == reqwest::StatusCode::OK
+                    || !matches!(name.as_str(), "content-length" | "content-encoding")
+            })
             .filter_map(|(name, value)| {
                 value
                     .to_str()
@@ -178,6 +232,7 @@ pub(super) fn write_disk_cache(
         stored_at,
         expires_at,
         vary,
+        head_only: options.head_only,
     };
     let previous_bytes = fs::metadata(&body_path).map_or(0, |metadata| metadata.len());
     let body_tmp = body_path.with_extension("body.tmp");
@@ -257,6 +312,16 @@ pub(super) fn cache_lifetime(cache: &CacheConfig, headers: &HeaderMap) -> Option
     let ttl = upstream_ttl
         .unwrap_or(cache.default_ttl_secs)
         .min(cache.max_ttl_secs);
+    (ttl > 0).then(|| {
+        let now = unix_timestamp();
+        (now, now.saturating_add(ttl))
+    })
+}
+
+/// Operator configured freshness for an answer the upstream did not publish a
+/// usable lifetime for, such as a negative result or a HEAD probe.
+pub(super) fn explicit_cache_lifetime(cache: &CacheConfig, ttl_secs: u64) -> Option<(u64, u64)> {
+    let ttl = ttl_secs.min(cache.max_ttl_secs);
     (ttl > 0).then(|| {
         let now = unix_timestamp();
         (now, now.saturating_add(ttl))
@@ -425,6 +490,7 @@ mod tests {
                         StatusCode::OK,
                         &headers,
                         &vec![index; 400 * 1024],
+                        DiskCacheWriteOptions::default(),
                     );
                 })
                 .await

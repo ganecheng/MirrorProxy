@@ -46,7 +46,7 @@ mod tests {
 
     use axum::{
         body::to_bytes,
-        http::{Request, StatusCode},
+        http::{Method, Request, StatusCode},
         routing::any,
         Router,
     };
@@ -137,7 +137,7 @@ mod tests {
 
     #[tokio::test]
     async fn cached_artifacts_preserve_payload_and_revalidate_with_etags() {
-        use axum::http::{HeaderMap, HeaderValue, Method};
+        use axum::http::{HeaderMap, HeaderValue};
         let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let observed = requests.clone();
         let app = Router::new().fallback(any(move |headers: HeaderMap| {
@@ -347,5 +347,132 @@ mod tests {
         assert_eq!(fallback_requests.lock().unwrap().len(), 1);
         primary_task.abort();
         fallback_task.abort();
+    }
+
+    async fn cached_state(maven: String) -> (AppState, std::path::PathBuf) {
+        let directory = std::env::temp_dir().join(format!(
+            "mirrorproxy-maven-cache-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let mut config = Config {
+            upstreams: crate::config::Upstreams {
+                maven,
+                ..crate::config::Upstreams::default()
+            },
+            ..Config::default()
+        };
+        config.cache.enabled = true;
+        config.cache.directory = directory.display().to_string();
+        config.cache.max_entry_mb = 1;
+        config.cache.max_total_mb = 8;
+        (test_state(config).await, directory)
+    }
+
+    async fn request_artifact(state: &AppState, method: Method, path: &str) -> Response {
+        proxy(
+            State(state.clone()),
+            Path(path.to_string()),
+            Request::builder()
+                .method(method)
+                .uri(format!("/maven/{path}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+    }
+
+    fn cache_status(response: &Response) -> Option<&str> {
+        response
+            .headers()
+            .get("x-mirrorproxy-cache")
+            .and_then(|value| value.to_str().ok())
+    }
+
+    #[tokio::test]
+    async fn cached_artifacts_never_reprobe_the_preceding_upstreams() {
+        let (primary, primary_requests, primary_task) =
+            spawn_upstream(StatusCode::NOT_FOUND, "missing").await;
+        let (fallback, fallback_requests, fallback_task) =
+            spawn_upstream(StatusCode::OK, "artifact payload").await;
+        let (state, directory) = cached_state(format!("{primary},{fallback}")).await;
+        let path = "org/example/demo/1.0/demo-1.0.jar";
+
+        for expected_cache in [None, Some("HIT")] {
+            let response = request_artifact(&state, Method::GET, path).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(cache_status(&response), expected_cache);
+            assert_eq!(
+                to_bytes(response.into_body(), usize::MAX).await.unwrap(),
+                "artifact payload"
+            );
+        }
+        // The artifact lives on the second endpoint, so a warm cache must not
+        // contact the first one again.
+        assert_eq!(primary_requests.lock().unwrap().len(), 1);
+        assert_eq!(fallback_requests.lock().unwrap().len(), 1);
+
+        crate::proxy::purge_cache(state.config().cache.clone())
+            .await
+            .unwrap();
+        let _ = std::fs::remove_dir_all(directory);
+        primary_task.abort();
+        fallback_task.abort();
+    }
+
+    #[tokio::test]
+    async fn unavailable_artifacts_are_remembered_once_every_upstream_agrees() {
+        let (primary, primary_requests, primary_task) =
+            spawn_upstream(StatusCode::NOT_FOUND, "missing").await;
+        let (fallback, fallback_requests, fallback_task) =
+            spawn_upstream(StatusCode::NOT_FOUND, "missing").await;
+        let (state, directory) = cached_state(format!("{primary},{fallback}")).await;
+        let path = "org/gradle/kotlin/kotlin-dsl/org.gradle.kotlin.kotlin-dsl.gradle.plugin/6.7.6/org.gradle.kotlin.kotlin-dsl.gradle.plugin-6.7.6.jar";
+
+        let first = request_artifact(&state, Method::HEAD, path).await;
+        assert_eq!(first.status(), StatusCode::NOT_FOUND);
+        assert_eq!(cache_status(&first), None);
+        let second = request_artifact(&state, Method::HEAD, path).await;
+        assert_eq!(second.status(), StatusCode::NOT_FOUND);
+        assert_eq!(cache_status(&second), Some("HIT"));
+        assert_eq!(primary_requests.lock().unwrap().len(), 1);
+        assert_eq!(fallback_requests.lock().unwrap().len(), 1);
+
+        crate::proxy::purge_cache(state.config().cache.clone())
+            .await
+            .unwrap();
+        let _ = std::fs::remove_dir_all(directory);
+        primary_task.abort();
+        fallback_task.abort();
+    }
+
+    #[tokio::test]
+    async fn head_answers_are_cached_without_answering_get_requests() {
+        let (upstream, upstream_requests, upstream_task) =
+            spawn_upstream(StatusCode::OK, "artifact payload").await;
+        let (state, directory) = cached_state(upstream).await;
+        let path = "org/example/demo/1.0/demo-1.0.jar";
+
+        for expected_cache in [None, Some("HIT")] {
+            let response = request_artifact(&state, Method::HEAD, path).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(cache_status(&response), expected_cache);
+        }
+        assert_eq!(upstream_requests.lock().unwrap().len(), 1);
+
+        let response = request_artifact(&state, Method::GET, path).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(cache_status(&response), None);
+        assert_eq!(
+            to_bytes(response.into_body(), usize::MAX).await.unwrap(),
+            "artifact payload"
+        );
+        assert_eq!(upstream_requests.lock().unwrap().len(), 2);
+
+        crate::proxy::purge_cache(state.config().cache.clone())
+            .await
+            .unwrap();
+        let _ = std::fs::remove_dir_all(directory);
+        upstream_task.abort();
     }
 }

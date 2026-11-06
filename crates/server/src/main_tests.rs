@@ -1491,6 +1491,12 @@ fn config_entries_include_public_and_quota_settings() {
         .any(|(key, value)| key == "cache.directory" && value == "mirrorproxy-cache"));
     assert!(entries
         .iter()
+        .any(|(key, value)| key == "cache.negative_ttl_secs" && value == "3600"));
+    assert!(entries
+        .iter()
+        .any(|(key, value)| key == "cache.head_ttl_secs" && value == "3600"));
+    assert!(entries
+        .iter()
         .any(|(key, value)| key == "outbound_proxy.enabled" && value == "false"));
     assert!(entries
         .iter()
@@ -1580,6 +1586,8 @@ fn plan_config_set_validates_values() {
     assert!(plan_config_set(&config, "quota.enabled", "yes").is_err());
     assert!(plan_config_set(&config, "quota.bidirectional_accounting", "true").is_ok());
     assert!(plan_config_set(&config, "cache.max_entry_mb", "0").is_err());
+    assert!(plan_config_set(&config, "cache.negative_ttl_secs", "0").is_ok());
+    assert!(plan_config_set(&config, "cache.head_ttl_secs", "3600").is_ok());
     assert!(plan_config_set(&config, "quota.on_exceeded", "drop").is_err());
     assert!(plan_config_set(&config, "timeout.request_secs", "0").is_err());
     assert!(plan_config_set(&config, "quota.monthly_gb", "0").is_ok());

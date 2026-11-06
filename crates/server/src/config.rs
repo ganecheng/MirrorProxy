@@ -304,6 +304,14 @@ pub struct CacheConfig {
     /// Upper bound for an upstream supplied max-age/s-maxage value.
     #[serde(default = "default_cache_max_ttl_secs")]
     pub max_ttl_secs: u64,
+    /// Freshness of a "not found" answer confirmed by every configured upstream.
+    /// `0` disables negative caching.
+    #[serde(default = "default_cache_negative_ttl_secs")]
+    pub negative_ttl_secs: u64,
+    /// Freshness of a cached HEAD answer, which carries headers but no body.
+    /// `0` disables HEAD caching.
+    #[serde(default = "default_cache_head_ttl_secs")]
+    pub head_ttl_secs: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -734,6 +742,16 @@ impl Config {
         if let Ok(value) = std::env::var("MIRRORPROXY_CACHE_MAX_TTL_SECS") {
             if let Ok(max_ttl_secs) = value.parse() {
                 self.cache.max_ttl_secs = max_ttl_secs;
+            }
+        }
+        if let Ok(value) = std::env::var("MIRRORPROXY_CACHE_NEGATIVE_TTL_SECS") {
+            if let Ok(negative_ttl_secs) = value.parse() {
+                self.cache.negative_ttl_secs = negative_ttl_secs;
+            }
+        }
+        if let Ok(value) = std::env::var("MIRRORPROXY_CACHE_HEAD_TTL_SECS") {
+            if let Ok(head_ttl_secs) = value.parse() {
+                self.cache.head_ttl_secs = head_ttl_secs;
             }
         }
         if let Ok(value) = std::env::var("MIRRORPROXY_GEOIP_ENABLED") {
@@ -1767,6 +1785,8 @@ impl Default for CacheConfig {
             max_total_mb: default_cache_max_total_mb(),
             default_ttl_secs: default_cache_default_ttl_secs(),
             max_ttl_secs: default_cache_max_ttl_secs(),
+            negative_ttl_secs: default_cache_negative_ttl_secs(),
+            head_ttl_secs: default_cache_head_ttl_secs(),
         }
     }
 }
@@ -2700,6 +2720,14 @@ fn default_cache_default_ttl_secs() -> u64 {
 
 fn default_cache_max_ttl_secs() -> u64 {
     24 * 60 * 60
+}
+
+fn default_cache_negative_ttl_secs() -> u64 {
+    60 * 60
+}
+
+fn default_cache_head_ttl_secs() -> u64 {
+    60 * 60
 }
 
 fn default_alert_quota_percent() -> u8 {

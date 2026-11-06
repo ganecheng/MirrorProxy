@@ -148,15 +148,42 @@ async fn forward_request(
             &config.upstream_selection,
         )
     };
+    let cacheable = cacheable_request(method.clone(), incoming_headers) && config.cache.enabled;
+    if cacheable {
+        // A cached answer lives under the endpoint that served it, which is often
+        // not the first configured one. Resolve it across the whole group first,
+        // so a warm artifact never pays for the preceding misses again.
+        let cache = config.cache.clone();
+        let cached_candidates = candidates.clone();
+        let headers = incoming_headers.clone();
+        let request_method = method.clone();
+        let hit = cache_work(false, move || {
+            cached_candidates.iter().find_map(|candidate| {
+                let metadata = load_disk_cache_metadata(&cache, candidate, &headers)?;
+                if metadata.expires_at <= unix_timestamp()
+                    || (metadata.head_only && request_method != Method::HEAD)
+                {
+                    return None;
+                }
+                load_disk_cache(&cache, candidate, &headers)
+            })
+        })
+        .await
+        .unwrap_or(None);
+        if let Some(entry) = hit {
+            return cached_response(entry, "HIT");
+        }
+    }
+    let mut not_found_everywhere = true;
     for (index, candidate) in candidates.iter().enumerate() {
-        let cached = if cacheable_request(method.clone(), incoming_headers) && config.cache.enabled
-        {
+        let cached = if cacheable {
             let cache = config.cache.clone();
             let candidate = candidate.clone();
             let headers = incoming_headers.clone();
             cache_work(false, move || load_disk_cache(&cache, &candidate, &headers))
                 .await
                 .unwrap_or(None)
+                .filter(|entry| cache_entry_serves(entry, &method))
         } else {
             None
         };
@@ -188,6 +215,7 @@ async fn forward_request(
         let upstream = match send_upstream_request(&client, &config, request).await {
             Ok(response) => response,
             Err(error) if index + 1 < candidates.len() => {
+                not_found_everywhere = false;
                 state
                     .upstream_selector
                     .record_failure(candidate, &config.upstream_selection);
@@ -195,6 +223,7 @@ async fn forward_request(
                 continue;
             }
             Err(error) => {
+                not_found_everywhere = false;
                 state
                     .upstream_selector
                     .record_failure(candidate, &config.upstream_selection);
@@ -223,6 +252,9 @@ async fn forward_request(
             state
                 .upstream_selector
                 .record_failure(candidate, &config.upstream_selection);
+            if status != StatusCode::NOT_FOUND {
+                not_found_everywhere = false;
+            }
             tracing::info!(upstream = %candidate, status = %status, next_upstream = %candidates[index + 1], "upstream did not return 200; trying the next configured endpoint");
             continue;
         }
@@ -236,15 +268,17 @@ async fn forward_request(
                 .record_success(candidate, started_at.elapsed());
         }
         let headers = upstream.headers().clone();
-        if cacheable_request(method.clone(), incoming_headers)
-            && config.cache.enabled
-            && status == StatusCode::OK
-            && headers
+        let head_only = method == Method::HEAD;
+        // A HEAD answer is stored without a body, so its declared length must not
+        // decide whether the answer is worth remembering.
+        let entry_size_fits = head_only
+            || headers
                 .get("content-length")
                 .and_then(|value| value.to_str().ok())
                 .and_then(|value| value.parse::<u64>().ok())
-                .is_some_and(|length| length <= max_cache_entry_bytes(&config.cache))
-        {
+                .is_some_and(|length| length <= max_cache_entry_bytes(&config.cache));
+        if cacheable && status == StatusCode::OK && entry_size_fits {
+            let entry_ttl = head_only.then_some(config.cache.head_ttl_secs);
             let response_body = upstream.bytes().await?;
             let cache = config.cache.clone();
             let candidate = candidate.clone();
@@ -259,10 +293,45 @@ async fn forward_request(
                     status,
                     &stored_headers,
                     &stored_body,
+                    DiskCacheWriteOptions {
+                        head_only,
+                        ttl_secs: entry_ttl,
+                    },
                 )
             })
             .await;
             return response_with_headers(status, &headers, Body::from(response_body));
+        }
+        if cacheable
+            && status == StatusCode::NOT_FOUND
+            && not_found_everywhere
+            && config.cache.negative_ttl_secs > 0
+        {
+            // Every configured endpoint agreed the artifact does not exist. Remember
+            // that for a bounded window so repeated misses, such as Gradle probing a
+            // plugin marker that has no jar, stop walking the whole group.
+            let cache = config.cache.clone();
+            let negative_candidates = candidates.clone();
+            let incoming = incoming_headers.clone();
+            let stored_headers = headers.clone();
+            let ttl_secs = config.cache.negative_ttl_secs;
+            let _ = cache_work(true, move || {
+                for candidate in &negative_candidates {
+                    write_disk_cache(
+                        &cache,
+                        candidate,
+                        &incoming,
+                        status,
+                        &stored_headers,
+                        &[],
+                        DiskCacheWriteOptions {
+                            head_only: false,
+                            ttl_secs: Some(ttl_secs),
+                        },
+                    );
+                }
+            })
+            .await;
         }
         let stream = upstream.bytes_stream().map_err(std::io::Error::other);
         return response_with_headers(status, &headers, Body::from_stream(stream));
@@ -503,7 +572,7 @@ pub(crate) async fn probe_endpoint(
 }
 
 fn cacheable_request(method: Method, headers: &HeaderMap) -> bool {
-    method == Method::GET
+    matches!(method, Method::GET | Method::HEAD)
         && !headers.contains_key("authorization")
         && !headers.contains_key("cookie")
         && !headers.contains_key("range")
@@ -752,6 +821,7 @@ mod tests {
             reqwest::StatusCode::OK,
             &headers,
             b"{} ",
+            DiskCacheWriteOptions::default(),
         );
 
         let response = cached_response(
@@ -772,14 +842,77 @@ mod tests {
     fn cacheable_requests_exclude_private_and_partial_responses() {
         let mut headers = HeaderMap::new();
         assert!(cacheable_request(Method::GET, &headers));
+        assert!(cacheable_request(Method::HEAD, &headers));
         headers.insert(
             header::AUTHORIZATION,
             HeaderValue::from_static("Bearer token"),
         );
         assert!(!cacheable_request(Method::GET, &headers));
+        assert!(!cacheable_request(Method::HEAD, &headers));
         headers.clear();
         headers.insert(header::RANGE, HeaderValue::from_static("bytes=0-99"));
         assert!(!cacheable_request(Method::GET, &headers));
+        assert!(!cacheable_request(Method::HEAD, &headers));
+        headers.clear();
+        headers.insert(header::COOKIE, HeaderValue::from_static("session=1"));
+        assert!(!cacheable_request(Method::GET, &headers));
+        assert!(!cacheable_request(Method::HEAD, &headers));
+        assert!(!cacheable_request(Method::POST, &HeaderMap::new()));
+    }
+
+    #[test]
+    fn explicit_cache_lifetimes_respect_the_configured_ceiling() {
+        let cache = CacheConfig {
+            default_ttl_secs: 60,
+            max_ttl_secs: 900,
+            ..CacheConfig::default()
+        };
+        let (stored_at, expires_at) = explicit_cache_lifetime(&cache, 3600).unwrap();
+        assert_eq!(expires_at - stored_at, 900);
+        assert!(explicit_cache_lifetime(&cache, 0).is_none());
+    }
+
+    #[test]
+    fn head_only_cache_writes_never_replace_a_cached_body() {
+        let directory = std::env::temp_dir().join(format!(
+            "mirrorproxy-cache-head-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&directory);
+        let cache = CacheConfig {
+            enabled: true,
+            directory: directory.display().to_string(),
+            max_entry_mb: 1,
+            max_total_mb: 2,
+            ..CacheConfig::default()
+        };
+        let url = Url::parse("https://upstream.example/artifact.jar").unwrap();
+        write_disk_cache(
+            &cache,
+            &url,
+            &HeaderMap::new(),
+            reqwest::StatusCode::OK,
+            &HeaderMap::new(),
+            b"artifact payload",
+            DiskCacheWriteOptions::default(),
+        );
+        write_disk_cache(
+            &cache,
+            &url,
+            &HeaderMap::new(),
+            reqwest::StatusCode::OK,
+            &HeaderMap::new(),
+            b"",
+            DiskCacheWriteOptions {
+                head_only: true,
+                ttl_secs: Some(3600),
+            },
+        );
+        let entry = load_disk_cache(&cache, &url, &HeaderMap::new()).expect("cache hit");
+        assert!(!entry.metadata.head_only);
+        assert_eq!(entry.body, b"artifact payload");
+        assert!(cache_entry_serves(&entry, &Method::GET));
+        let _ = fs::remove_dir_all(directory);
     }
 
     #[test]
@@ -878,6 +1011,7 @@ mod tests {
             reqwest::StatusCode::OK,
             &HeaderMap::new(),
             b"entry",
+            DiskCacheWriteOptions::default(),
         );
         let (body, metadata) = cache_paths(&cache, &url).unwrap();
         assert!(!body.exists());
@@ -909,6 +1043,7 @@ mod tests {
             reqwest::StatusCode::OK,
             &headers,
             &payload,
+            DiskCacheWriteOptions::default(),
         );
         let (first_body, _) = cache_paths(&cache, &first).unwrap();
         write_disk_cache(
@@ -918,6 +1053,7 @@ mod tests {
             reqwest::StatusCode::OK,
             &headers,
             &payload,
+            DiskCacheWriteOptions::default(),
         );
         fs::OpenOptions::new()
             .write(true)
@@ -933,6 +1069,7 @@ mod tests {
             reqwest::StatusCode::OK,
             &headers,
             &payload,
+            DiskCacheWriteOptions::default(),
         );
         let (second_body, _) = cache_paths(&cache, &second).unwrap();
         assert!(first_body.exists());
