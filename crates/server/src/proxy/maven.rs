@@ -42,7 +42,7 @@ pub async fn proxy(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex, RwLock};
+    use std::sync::{Arc, Mutex};
 
     use axum::{
         body::to_bytes,
@@ -51,7 +51,7 @@ mod tests {
         Router,
     };
 
-    use crate::{config::Config, database::Database, observability::Observability, RateLimiter};
+    use crate::config::Config;
 
     use super::*;
 
@@ -112,27 +112,7 @@ mod tests {
     }
 
     async fn test_state(config: Config) -> AppState {
-        let (database, _) = Database::open(":memory:").await.unwrap();
-        AppState {
-            downloads: Arc::new(crate::download::Runtime::default()),
-            config: Arc::new(RwLock::new(Arc::new(config))),
-            database: Arc::new(database),
-            client: Arc::new(RwLock::new(reqwest::Client::new())),
-            rate_limiter: Arc::new(RateLimiter::new()),
-            admin_login_limiter: Arc::new(crate::AdminLoginRateLimiter::new()),
-            discoverable_challenges: Default::default(),
-            webauthn: Arc::new(RwLock::new(None)),
-            observability: Arc::new(Observability::new().unwrap()),
-            geoip: Arc::new(crate::geoip::GeoIpService::new(
-                false,
-                "missing-v4.xdb".into(),
-                "missing-v6.xdb".into(),
-            )),
-            ip_access_policy: Arc::new(RwLock::new(crate::geoip::IpAccessPolicy::default())),
-            acme_environment_managed: false,
-            acme: crate::test_acme_manager(),
-            upstream_selector: Arc::new(crate::upstream_selection::UpstreamSelector::default()),
-        }
+        crate::test_app_state(config).await
     }
 
     #[tokio::test]

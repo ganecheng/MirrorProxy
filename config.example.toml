@@ -154,16 +154,22 @@ max_total_mb = 256
 # Used only when the upstream omits an explicit public max-age. Mutable package
 # indexes are revalidated after this interval with ETag or Last-Modified.
 default_ttl_secs = 300
-# Never trust an upstream cache lifetime longer than this local ceiling.
+# Never trust an upstream cache lifetime longer than this local ceiling. It also
+# caps negative_ttl_secs, head_ttl_secs, and document_ttl_secs.
 max_ttl_secs = 86400
 # A cached answer is resolved across the whole upstream group first, so an
 # artifact served by a later endpoint is never re-probed through the earlier
 # ones. A "not found" answer is remembered only when every configured endpoint
-# agrees; 0 disables negative caching, and max_ttl_secs still caps it.
-negative_ttl_secs = 3600
+# agrees; 0 disables negative caching.
+negative_ttl_secs = 86400
 # HEAD answers are cached without a body and only answer another HEAD request.
-# 0 disables HEAD caching, and max_ttl_secs still caps it.
-head_ttl_secs = 3600
+# 0 disables HEAD caching.
+head_ttl_secs = 86400
+# Documents cached as published and rewritten per request, such as pub package
+# metadata JSON. Clients are told max-age=300, so this only controls how long the
+# mirror reuses its own copy; clear it from the admin cache controls after an
+# upstream publishes something you need immediately. 0 disables it.
+document_ttl_secs = 86400
 
 # Offline ip2region XDB v3 databases. Missing or invalid files degrade regional
 # traffic to "Unknown" without stopping proxy or IP access-list enforcement.

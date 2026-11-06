@@ -40,7 +40,7 @@ use std::{
 };
 
 use axum::{
-    body::Body,
+    body::{Body, Bytes},
     http::{header, HeaderMap, HeaderName, HeaderValue, Method, StatusCode},
     response::Response,
 };
@@ -400,6 +400,89 @@ pub async fn get_with_fallback(
     unreachable!("every upstream request has at least one candidate")
 }
 
+/// A document buffered for per-request rewriting, such as pub package metadata
+/// that embeds this instance's public URL.
+pub struct CachedDocument {
+    pub body: Bytes,
+    pub content_type: String,
+    /// `HIT` when the disk cache answered without contacting an upstream.
+    pub cache_status: &'static str,
+}
+
+/// Fetches an upstream JSON document through the disk cache and buffers its body.
+/// Adapters that must rewrite a document per request use this instead of reading
+/// a forwarded stream, so the upstream representation is still cached.
+pub async fn cached_document(
+    state: &AppState,
+    url: Url,
+    incoming_headers: &HeaderMap,
+) -> Result<Option<CachedDocument>, ProxyError> {
+    let config = state.config();
+    let cacheable = cacheable_request(Method::GET, incoming_headers) && config.cache.enabled;
+    if cacheable {
+        let cache = config.cache.clone();
+        let cached_url = url.clone();
+        let headers = incoming_headers.clone();
+        let hit = cache_work(false, move || load_disk_cache(&cache, &cached_url, &headers))
+            .await
+            .unwrap_or(None)
+            .filter(|entry| {
+                entry.metadata.status == StatusCode::OK.as_u16()
+                    && entry.metadata.expires_at > unix_timestamp()
+            });
+        if let Some(entry) = hit {
+            return Ok(Some(CachedDocument {
+                content_type: cached_header(&entry.metadata, "content-type")
+                    .unwrap_or_default()
+                    .to_string(),
+                body: Bytes::from(entry.body),
+                cache_status: "HIT",
+            }));
+        }
+    }
+    let response = get_with_fallback(state, url.clone()).await?;
+    if response.status() != StatusCode::OK {
+        return Ok(None);
+    }
+    let content_type = response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    // The buffered body is decoded, so body-specific headers must not describe it.
+    let mut stored_headers = response.headers().clone();
+    stored_headers.remove(header::CONTENT_ENCODING);
+    stored_headers.remove(header::CONTENT_LENGTH);
+    let body = response.bytes().await?;
+    if cacheable && body.len() as u64 <= max_cache_entry_bytes(&config.cache) {
+        let cache = config.cache.clone();
+        let incoming = incoming_headers.clone();
+        let stored_body = body.clone();
+        let ttl_secs = config.cache.document_ttl_secs;
+        let _ = cache_work(true, move || {
+            write_disk_cache(
+                &cache,
+                &url,
+                &incoming,
+                StatusCode::OK,
+                &stored_headers,
+                &stored_body,
+                DiskCacheWriteOptions {
+                    head_only: false,
+                    ttl_secs: Some(ttl_secs),
+                },
+            )
+        })
+        .await;
+    }
+    Ok(Some(CachedDocument {
+        body,
+        content_type,
+        cache_status: "MISS",
+    }))
+}
+
 fn upstream_request(
     client: &reqwest::Client,
     method: reqwest::Method,
@@ -653,6 +736,9 @@ pub fn proxied_absolute_url(public_base_url: &str, absolute: &str) -> String {
     format!("{}/{}", public_base_url.trim_end_matches('/'), absolute)
 }
 
+/// Client-facing freshness for rewritten metadata. It stays shorter than
+/// `cache.document_ttl_secs`, so a client revalidates long before the origin
+/// cache entry expires.
 pub fn metadata_cache_value() -> HeaderValue {
     HeaderValue::from_static("public, max-age=300, stale-while-revalidate=3600")
 }

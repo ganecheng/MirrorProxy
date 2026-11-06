@@ -319,7 +319,8 @@ pub(super) fn cache_lifetime(cache: &CacheConfig, headers: &HeaderMap) -> Option
 }
 
 /// Operator configured freshness for an answer the upstream did not publish a
-/// usable lifetime for, such as a negative result or a HEAD probe.
+/// usable lifetime for, such as a negative result, a HEAD probe, or a document
+/// that is rewritten per request.
 pub(super) fn explicit_cache_lifetime(cache: &CacheConfig, ttl_secs: u64) -> Option<(u64, u64)> {
     let ttl = ttl_secs.min(cache.max_ttl_secs);
     (ttl > 0).then(|| {

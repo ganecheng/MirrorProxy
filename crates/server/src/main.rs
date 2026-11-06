@@ -293,6 +293,29 @@ pub(crate) fn test_acme_manager() -> Arc<acme::AcmeManager> {
     acme::AcmeManager::new(config::AcmeConfig::default()).0
 }
 
+/// Builds application state with an in-memory database for adapter tests that
+/// need the real caching and forwarding paths.
+#[cfg(test)]
+pub(crate) async fn test_app_state(config: config::Config) -> AppState {
+    let (database, _) = Database::open(":memory:").await.unwrap();
+    AppState {
+        downloads: Arc::new(download::Runtime::default()),
+        config: Arc::new(RwLock::new(Arc::new(config))),
+        database: Arc::new(database),
+        client: Arc::new(RwLock::new(Client::new())),
+        rate_limiter: Arc::new(RateLimiter::new()),
+        admin_login_limiter: Arc::new(AdminLoginRateLimiter::new()),
+        discoverable_challenges: Default::default(),
+        webauthn: Arc::new(RwLock::new(None)),
+        observability: Arc::new(Observability::new().unwrap()),
+        geoip: GeoIpService::new(false, "missing-v4.xdb".into(), "missing-v6.xdb".into()),
+        ip_access_policy: Arc::new(RwLock::new(IpAccessPolicy::default())),
+        acme_environment_managed: false,
+        acme: test_acme_manager(),
+        upstream_selector: Arc::new(upstream_selection::UpstreamSelector::default()),
+    }
+}
+
 fn request_public_base_url(headers: &HeaderMap) -> Option<String> {
     let host = forwarded_header_value(headers, "x-forwarded-host")
         .or_else(|| header_value(headers, header::HOST))?;
@@ -1383,6 +1406,11 @@ fn config_set_spec(key: &str) -> Option<ConfigSetSpec> {
             "cache.head_ttl_secs",
             ConfigValueKind::U64,
         ),
+        "cache.document_ttl_secs" => (
+            "cache.document_ttl_secs",
+            "cache.document_ttl_secs",
+            ConfigValueKind::U64,
+        ),
         "download.enabled" => (
             "download.enabled",
             "download.enabled",
@@ -1629,6 +1657,7 @@ fn config_value(config: &Config, key: &str) -> Option<String> {
         "cache.max_ttl_secs" => Some(config.cache.max_ttl_secs.to_string()),
         "cache.negative_ttl_secs" => Some(config.cache.negative_ttl_secs.to_string()),
         "cache.head_ttl_secs" => Some(config.cache.head_ttl_secs.to_string()),
+        "cache.document_ttl_secs" => Some(config.cache.document_ttl_secs.to_string()),
         "download.enabled" => Some(config.download.enabled.to_string()),
         "download.max_file_bytes" => Some(config.download.max_file_bytes.to_string()),
         "download.daily_user_bytes" => Some(config.download.daily_user_bytes.to_string()),
@@ -1746,6 +1775,7 @@ fn config_entries(config: &Config) -> Vec<(String, String)> {
         "cache.max_ttl_secs",
         "cache.negative_ttl_secs",
         "cache.head_ttl_secs",
+        "cache.document_ttl_secs",
         "download.enabled",
         "download.max_file_bytes",
         "download.daily_user_bytes",

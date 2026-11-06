@@ -55,7 +55,7 @@ export type AdminConfig = Omit<PublicConfig, 'quota' | 'user_access' | 'site'> &
     insecure_skip_verify: boolean
   }
   rate_limit: { enabled: boolean; requests_per_minute: number }
-  cache: { enabled: boolean; directory: string; max_entry_mb: number; max_total_mb: number; default_ttl_secs: number; max_ttl_secs: number; negative_ttl_secs: number; head_ttl_secs: number }
+  cache: { enabled: boolean; directory: string; max_entry_mb: number; max_total_mb: number; default_ttl_secs: number; max_ttl_secs: number; negative_ttl_secs: number; head_ttl_secs: number; document_ttl_secs: number }
   geoip: { enabled: boolean; ipv4_path: string; ipv6_path: string }
   user_access: {
     base_domain: string

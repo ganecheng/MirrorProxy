@@ -3,7 +3,7 @@ use crate::{proxy, AppState};
 use axum::{
     body::Body,
     extract::{Path, State},
-    http::{header, HeaderValue},
+    http::{header, HeaderValue, StatusCode},
     response::Response,
 };
 use serde_json::Value;
@@ -76,29 +76,27 @@ pub async fn proxy(
     if is_archive_path(&path) {
         return proxy::forward(&state, request.method().clone(), url, request.headers()).await;
     }
-    let response = proxy::get_with_fallback(&state, url).await?;
-    let status = response.status();
-    let content_type = response
-        .headers()
-        .get(header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_owned();
-    if !(status.is_success() && content_type.contains("json")) {
-        let url = repository_url(&config.upstreams.pub_repository, &path, query)?;
+    // The upstream document is cached as published and rewritten per request,
+    // because the embedded archive URLs depend on this instance's public URL.
+    let Some(document) = proxy::cached_document(&state, url.clone(), request.headers()).await?
+    else {
+        return proxy::forward(&state, request.method().clone(), url, request.headers()).await;
+    };
+    if !document.content_type.contains("json") {
         return proxy::forward(&state, request.method().clone(), url, request.headers()).await;
     }
-    let bytes = response.bytes().await?;
-    let mut value: Value = serde_json::from_slice(&bytes).map_err(|_| ProxyError::InvalidUrl)?;
+    let mut value: Value =
+        serde_json::from_slice(&document.body).map_err(|_| ProxyError::InvalidUrl)?;
     rewrite_archive_urls(&mut value, &state.public_base_url(request.headers()));
     Response::builder()
-        .status(status)
+        .status(StatusCode::OK)
         .header(header::CACHE_CONTROL, proxy::metadata_cache_value())
         .header(header::VARY, proxy::metadata_vary_value())
         .header(
             header::CONTENT_TYPE,
             HeaderValue::from_static("application/json; charset=utf-8"),
         )
+        .header("x-mirrorproxy-cache", document.cache_status)
         .body(Body::from(
             serde_json::to_vec(&value).map_err(|_| ProxyError::InvalidUrl)?,
         ))
@@ -209,6 +207,15 @@ fn proxied_archive_url(url: &str, base: &str) -> Option<String> {
 }
 #[cfg(test)]
 mod tests {
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+
+    use axum::{body::to_bytes, routing::any, Router};
+
+    use crate::config::Config;
+
     use super::*;
     #[test]
     fn rejects_unsafe_path() {
@@ -331,5 +338,77 @@ mod tests {
     fn archives_stream_through_the_cache_path() {
         assert!(is_archive_path("api/archives/http-1.6.0.tar.gz"));
         assert!(!is_archive_path("api/packages/http"));
+    }
+
+    type MockUpstream = (String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>);
+
+    async fn spawn_metadata_upstream() -> MockUpstream {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&requests);
+        let app = Router::new().fallback(any(move |_: axum::extract::Request| {
+            let observed = Arc::clone(&observed);
+            async move {
+                observed.fetch_add(1, Ordering::SeqCst);
+                (
+                    [(header::CONTENT_TYPE, "application/json")],
+                    r#"{"name":"http","latest":{"version":"1.6.0","archive_url":"https://pub.dev/api/archives/http-1.6.0.tar.gz"}}"#,
+                )
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{address}/repository"), requests, task)
+    }
+
+    #[tokio::test]
+    async fn package_metadata_is_rewritten_from_a_cached_upstream_document() {
+        let (upstream, requests, task) = spawn_metadata_upstream().await;
+        let directory = std::env::temp_dir().join(format!(
+            "mirrorproxy-pub-cache-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let mut config = Config {
+            public_base_url: "https://mirror.example".to_string(),
+            upstreams: crate::config::Upstreams {
+                pub_repository: upstream,
+                ..crate::config::Upstreams::default()
+            },
+            ..Config::default()
+        };
+        config.cache.enabled = true;
+        config.cache.directory = directory.display().to_string();
+        config.cache.max_entry_mb = 1;
+        config.cache.max_total_mb = 8;
+        let state = crate::test_app_state(config).await;
+
+        for expected_status in ["MISS", "HIT"] {
+            let response = proxy(
+                State(state.clone()),
+                Path("api/packages/http".to_string()),
+                axum::extract::Request::builder()
+                    .uri("/pub/api/packages/http")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(response.headers()["x-mirrorproxy-cache"], expected_status);
+            let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            let value: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(
+                value["latest"]["archive_url"],
+                "https://mirror.example/pub/upstream/pub.dev/api/archives/http-1.6.0.tar.gz"
+            );
+        }
+        // The document is fetched once and rewritten for every client.
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+
+        crate::proxy::purge_cache(state.config().cache.clone())
+            .await
+            .unwrap();
+        let _ = std::fs::remove_dir_all(directory);
+        task.abort();
     }
 }

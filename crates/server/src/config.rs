@@ -312,6 +312,11 @@ pub struct CacheConfig {
     /// `0` disables HEAD caching.
     #[serde(default = "default_cache_head_ttl_secs")]
     pub head_ttl_secs: u64,
+    /// Freshness of an upstream document that is cached as published and
+    /// rewritten per request, such as package metadata JSON. The `/admin`
+    /// cache operations clear these entries on demand. `0` disables it.
+    #[serde(default = "default_cache_document_ttl_secs")]
+    pub document_ttl_secs: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -752,6 +757,11 @@ impl Config {
         if let Ok(value) = std::env::var("MIRRORPROXY_CACHE_HEAD_TTL_SECS") {
             if let Ok(head_ttl_secs) = value.parse() {
                 self.cache.head_ttl_secs = head_ttl_secs;
+            }
+        }
+        if let Ok(value) = std::env::var("MIRRORPROXY_CACHE_DOCUMENT_TTL_SECS") {
+            if let Ok(document_ttl_secs) = value.parse() {
+                self.cache.document_ttl_secs = document_ttl_secs;
             }
         }
         if let Ok(value) = std::env::var("MIRRORPROXY_GEOIP_ENABLED") {
@@ -1787,6 +1797,7 @@ impl Default for CacheConfig {
             max_ttl_secs: default_cache_max_ttl_secs(),
             negative_ttl_secs: default_cache_negative_ttl_secs(),
             head_ttl_secs: default_cache_head_ttl_secs(),
+            document_ttl_secs: default_cache_document_ttl_secs(),
         }
     }
 }
@@ -2723,11 +2734,15 @@ fn default_cache_max_ttl_secs() -> u64 {
 }
 
 fn default_cache_negative_ttl_secs() -> u64 {
-    60 * 60
+    24 * 60 * 60
 }
 
 fn default_cache_head_ttl_secs() -> u64 {
-    60 * 60
+    24 * 60 * 60
+}
+
+fn default_cache_document_ttl_secs() -> u64 {
+    24 * 60 * 60
 }
 
 fn default_alert_quota_percent() -> u8 {

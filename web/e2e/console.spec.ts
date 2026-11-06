@@ -77,7 +77,7 @@ const adminConfig = {
   alerts: { enabled: false, webhook_url: '', has_webhook_url: false, email_enabled: false, email_recipients: [], quota_percent: 80, source_failures: 3, cooldown_secs: 3600 },
   outbound_proxy: { enabled: false, url: '', no_proxy: ['127.0.0.1', 'localhost'], username: null, password: null, has_password: false },
   rate_limit: { enabled: true, requests_per_minute: 120 },
-  cache: { enabled: false, directory: 'cache', max_entry_mb: 8, max_total_mb: 256, default_ttl_secs: 300, max_ttl_secs: 86400, negative_ttl_secs: 3600, head_ttl_secs: 3600 },
+  cache: { enabled: false, directory: 'cache', max_entry_mb: 8, max_total_mb: 256, default_ttl_secs: 300, max_ttl_secs: 86400, negative_ttl_secs: 86400, head_ttl_secs: 86400, document_ttl_secs: 86400 },
   user_access: { base_domain: '', mode: 'public', infrastructure_ready: false, routing_id_min_length: 12, routing_rotation_cooldown_hours: 24 },
   registration: { mode: 'invite_only', allowed_email_domains: [], email_token_ttl_minutes: 10 },
   webauthn: { enabled: false, rp_id: '', rp_origin: '', rp_name: 'MirrorProxy', require_passkey: false, break_glass_username: 'admin' },
