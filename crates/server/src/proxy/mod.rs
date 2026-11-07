@@ -33,10 +33,12 @@ pub mod texlive;
 pub mod winget;
 
 use std::{
+    collections::HashMap,
     fs,
     net::IpAddr,
     path::{Path, PathBuf},
-    time::{Instant, SystemTime, UNIX_EPOCH},
+    sync::{Mutex, OnceLock},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use axum::{
@@ -44,7 +46,7 @@ use axum::{
     http::{header, HeaderMap, HeaderName, HeaderValue, Method, StatusCode},
     response::Response,
 };
-use futures_util::TryStreamExt;
+use futures_util::{stream::FuturesUnordered, StreamExt, TryStreamExt};
 use opentelemetry::global;
 use opentelemetry_http::HeaderInjector;
 use reqwest::Url;
@@ -140,6 +142,9 @@ async fn forward_request(
         .map_err(|_| ProxyError::MethodNotAllowed)?;
     let config = state.config();
     let client = state.client();
+    // Keyed on the requested artifact rather than on the endpoint that serves
+    // it, so a concurrent duplicate joins the leader's fetch.
+    let in_flight_key = format!("{method} {url}");
     let candidates = if body.is_some() {
         vec![url]
     } else {
@@ -149,31 +154,34 @@ async fn forward_request(
         )
     };
     let cacheable = cacheable_request(method.clone(), incoming_headers) && config.cache.enabled;
+    let cache_config = &config.cache;
     if cacheable {
         // A cached answer lives under the endpoint that served it, which is often
         // not the first configured one. Resolve it across the whole group first,
         // so a warm artifact never pays for the preceding misses again.
-        let cache = config.cache.clone();
-        let cached_candidates = candidates.clone();
-        let headers = incoming_headers.clone();
-        let request_method = method.clone();
-        let hit = cache_work(false, move || {
-            cached_candidates.iter().find_map(|candidate| {
-                let metadata = load_disk_cache_metadata(&cache, candidate, &headers)?;
-                if metadata.expires_at <= unix_timestamp()
-                    || (metadata.head_only && request_method != Method::HEAD)
-                {
-                    return None;
-                }
-                load_disk_cache(&cache, candidate, &headers)
-            })
-        })
-        .await
-        .unwrap_or(None);
-        if let Some(entry) = hit {
+        let hit = cached_hit(cache_config, &candidates, incoming_headers, &method);
+        if let Some(entry) = hit.await {
             return cached_response(entry, "HIT");
         }
     }
+    // Coalesce concurrent fetches of the same artifact: the leader walks the
+    // upstream group and fills the cache, while followers wait for it and then
+    // read the answer from disk instead of repeating the same upstream work.
+    let mut leader = None;
+    if cacheable {
+        match begin_in_flight(in_flight_key) {
+            InFlight::Leader(guard) => leader = Some(guard),
+            InFlight::Follower(done) => {
+                let limit = Duration::from_secs(config.timeout.request_secs.max(1));
+                wait_for_in_flight(done, limit).await;
+                let hit = cached_hit(cache_config, &candidates, incoming_headers, &method);
+                if let Some(entry) = hit.await {
+                    return cached_response(entry, "HIT");
+                }
+            }
+        }
+    }
+    let _leader = leader;
     let mut not_found_everywhere = true;
     for (index, candidate) in candidates.iter().enumerate() {
         let cached = if cacheable {
@@ -219,8 +227,18 @@ async fn forward_request(
                 state
                     .upstream_selector
                     .record_failure(candidate, &config.upstream_selection);
-                tracing::warn!(upstream = %candidate, %error, next_upstream = %candidates[index + 1], "upstream request failed; trying the next configured endpoint");
-                continue;
+                tracing::warn!(upstream = %candidate, %error, "upstream request failed; racing the remaining configured endpoints");
+                return forward_remaining_upstreams(
+                    state,
+                    &config,
+                    &method,
+                    &candidates,
+                    &candidates[index + 1..],
+                    incoming_headers,
+                    cacheable,
+                    not_found_everywhere,
+                )
+                .await;
             }
             Err(error) => {
                 not_found_everywhere = false;
@@ -255,8 +273,18 @@ async fn forward_request(
             if status != StatusCode::NOT_FOUND {
                 not_found_everywhere = false;
             }
-            tracing::info!(upstream = %candidate, status = %status, next_upstream = %candidates[index + 1], "upstream did not return 200; trying the next configured endpoint");
-            continue;
+            tracing::info!(upstream = %candidate, status = %status, "upstream did not return 200; racing the remaining configured endpoints");
+            return forward_remaining_upstreams(
+                state,
+                &config,
+                &method,
+                &candidates,
+                &candidates[index + 1..],
+                incoming_headers,
+                cacheable,
+                not_found_everywhere,
+            )
+            .await;
         }
         if should_failover_status(status) {
             state
@@ -267,76 +295,326 @@ async fn forward_request(
                 .upstream_selector
                 .record_success(candidate, started_at.elapsed());
         }
-        let headers = upstream.headers().clone();
-        let head_only = method == Method::HEAD;
-        // A HEAD answer is stored without a body, so its declared length must not
-        // decide whether the answer is worth remembering.
-        let entry_size_fits = head_only
-            || headers
-                .get("content-length")
-                .and_then(|value| value.to_str().ok())
-                .and_then(|value| value.parse::<u64>().ok())
-                .is_some_and(|length| length <= max_cache_entry_bytes(&config.cache));
-        if cacheable && status == StatusCode::OK && entry_size_fits {
-            let entry_ttl = head_only.then_some(config.cache.head_ttl_secs);
-            let response_body = upstream.bytes().await?;
+        return finish_upstream_response(
+            &config,
+            &method,
+            incoming_headers,
+            cacheable,
+            &candidates,
+            candidate,
+            cached,
+            upstream,
+            not_found_everywhere,
+        )
+        .await;
+    }
+    unreachable!("every upstream request has at least one candidate")
+}
+
+/// Concurrent fetches of one artifact share a single upstream walk.
+type InFlightMap = HashMap<String, tokio::sync::watch::Receiver<bool>>;
+
+static IN_FLIGHT: OnceLock<Mutex<InFlightMap>> = OnceLock::new();
+
+fn in_flight_requests() -> &'static Mutex<InFlightMap> {
+    IN_FLIGHT.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+struct InFlightGuard {
+    key: String,
+    done: tokio::sync::watch::Sender<bool>,
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        let _ = self.done.send(true);
+        if let Some(in_flight) = IN_FLIGHT.get() {
+            if let Ok(mut pending) = in_flight.lock() {
+                pending.remove(&self.key);
+            }
+        }
+    }
+}
+
+enum InFlight {
+    Leader(InFlightGuard),
+    Follower(tokio::sync::watch::Receiver<bool>),
+}
+
+fn begin_in_flight(key: String) -> InFlight {
+    let mut in_flight = in_flight_requests()
+        .lock()
+        .expect("in-flight lock poisoned");
+    if let Some(done) = in_flight.get(&key) {
+        return InFlight::Follower(done.clone());
+    }
+    let (done, waiting) = tokio::sync::watch::channel(false);
+    in_flight.insert(key.clone(), waiting);
+    InFlight::Leader(InFlightGuard { key, done })
+}
+
+async fn wait_for_in_flight(mut done: tokio::sync::watch::Receiver<bool>, limit: Duration) {
+    let waited = tokio::time::timeout(limit, async {
+        loop {
+            let finished = *done.borrow();
+            if finished || done.changed().await.is_err() {
+                break;
+            }
+        }
+    })
+    .await;
+    if waited.is_err() {
+        tracing::warn!("timed out waiting for a concurrent fetch of the same artifact");
+    }
+}
+
+/// Resolves a fresh cache entry under any endpoint of the group, so an artifact
+/// served by a later endpoint never pays for the preceding misses again.
+async fn cached_hit(
+    cache: &CacheConfig,
+    candidates: &[Url],
+    incoming_headers: &HeaderMap,
+    method: &Method,
+) -> Option<DiskCacheEntry> {
+    let cache = cache.clone();
+    let candidates = candidates.to_vec();
+    let headers = incoming_headers.clone();
+    let request_method = method.clone();
+    cache_work(false, move || {
+        candidates.iter().find_map(|candidate| {
+            let metadata = load_disk_cache_metadata(&cache, candidate, &headers)?;
+            if metadata.expires_at <= unix_timestamp()
+                || (metadata.head_only && request_method != Method::HEAD)
+            {
+                return None;
+            }
+            load_disk_cache(&cache, candidate, &headers)
+        })
+    })
+    .await
+    .unwrap_or(None)
+}
+
+struct RaceOutcome {
+    winner: Option<(Url, reqwest::Response)>,
+    /// A non-404 failure such as an upstream timeout or rate limit.
+    failure: Option<(Url, reqwest::Response)>,
+    /// The last resort: every endpoint that answered said "not found".
+    not_found_fallback: Option<(Url, reqwest::Response)>,
+    last_error: Option<ProxyError>,
+    not_found_everywhere: bool,
+}
+
+/// Probes every remaining endpoint at once. A slow or hanging endpoint can then
+/// only delay its own answer instead of serializing the requests behind it.
+async fn race_upstreams(
+    state: &AppState,
+    config: &crate::config::Config,
+    method: &Method,
+    candidates: &[Url],
+    incoming_headers: &HeaderMap,
+) -> RaceOutcome {
+    let client = state.client();
+    let reqwest_method = reqwest::Method::from_bytes(method.as_str().as_bytes())
+        .expect("request methods are validated before forwarding");
+    let mut pending = FuturesUnordered::new();
+    for candidate in candidates {
+        let client = client.clone();
+        let method = reqwest_method.clone();
+        let candidate = candidate.clone();
+        let headers = incoming_headers.clone();
+        pending.push(async move {
+            let started_at = Instant::now();
+            let request = upstream_request(&client, method, candidate.clone(), &headers, config);
+            let result = send_upstream_request(&client, config, request).await;
+            (candidate, result, started_at.elapsed())
+        });
+    }
+    let mut outcome = RaceOutcome {
+        winner: None,
+        failure: None,
+        not_found_fallback: None,
+        last_error: None,
+        not_found_everywhere: true,
+    };
+    while let Some((candidate, result, elapsed)) = pending.next().await {
+        match result {
+            Ok(response) if !should_failover_status(response.status()) => {
+                state.upstream_selector.record_success(&candidate, elapsed);
+                outcome.winner = Some((candidate, response));
+                return outcome;
+            }
+            Ok(response) => {
+                if response.status() == StatusCode::NOT_FOUND {
+                    outcome
+                        .not_found_fallback
+                        .get_or_insert((candidate.clone(), response));
+                } else {
+                    outcome.not_found_everywhere = false;
+                    outcome.failure.get_or_insert((candidate.clone(), response));
+                }
+                state
+                    .upstream_selector
+                    .record_failure(&candidate, &config.upstream_selection);
+            }
+            Err(error) => {
+                outcome.not_found_everywhere = false;
+                state
+                    .upstream_selector
+                    .record_failure(&candidate, &config.upstream_selection);
+                tracing::warn!(upstream = %candidate, %error, "upstream request failed; continuing with the other configured endpoints");
+                outcome.last_error = Some(error);
+            }
+        }
+    }
+    outcome
+}
+
+/// Finishes a request from the endpoint that answered: revalidates a cached
+/// copy, refreshes the cache, or streams the upstream body back.
+#[allow(clippy::too_many_arguments)]
+async fn finish_upstream_response(
+    config: &crate::config::Config,
+    method: &Method,
+    incoming_headers: &HeaderMap,
+    cacheable: bool,
+    candidates: &[Url],
+    candidate: &Url,
+    cached: Option<DiskCacheEntry>,
+    upstream: reqwest::Response,
+    not_found_everywhere: bool,
+) -> Result<Response, ProxyError> {
+    let status = upstream.status();
+    if status == StatusCode::NOT_MODIFIED {
+        if let Some(mut entry) = cached {
             let cache = config.cache.clone();
-            let candidate = candidate.clone();
-            let incoming = incoming_headers.clone();
-            let stored_headers = headers.clone();
-            let stored_body = response_body.clone();
-            let _ = cache_work(true, move || {
+            let cache_candidate = candidate.clone();
+            let headers = upstream.headers().clone();
+            entry = cache_work(true, move || {
+                refresh_cache_metadata(&cache, &cache_candidate, &mut entry.metadata, &headers);
+                entry
+            })
+            .await
+            .map_err(|_| ProxyError::CacheWorker)?;
+            return cached_response(entry, "REVALIDATED");
+        }
+    }
+    let headers = upstream.headers().clone();
+    let head_only = *method == Method::HEAD;
+    // A HEAD answer is stored without a body, so its declared length must not
+    // decide whether the answer is worth remembering.
+    let entry_size_fits = head_only
+        || headers
+            .get("content-length")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<u64>().ok())
+            .is_some_and(|length| length <= max_cache_entry_bytes(&config.cache));
+    if cacheable && status == StatusCode::OK && entry_size_fits {
+        let entry_ttl = head_only.then_some(config.cache.head_ttl_secs);
+        let response_body = upstream.bytes().await?;
+        let cache = config.cache.clone();
+        let candidate = candidate.clone();
+        let incoming = incoming_headers.clone();
+        let stored_headers = headers.clone();
+        let stored_body = response_body.clone();
+        let _ = cache_work(true, move || {
+            write_disk_cache(
+                &cache,
+                &candidate,
+                &incoming,
+                status,
+                &stored_headers,
+                &stored_body,
+                DiskCacheWriteOptions {
+                    head_only,
+                    ttl_secs: entry_ttl,
+                },
+            )
+        })
+        .await;
+        return response_with_headers(status, &headers, Body::from(response_body));
+    }
+    if cacheable
+        && status == StatusCode::NOT_FOUND
+        && not_found_everywhere
+        && config.cache.negative_ttl_secs > 0
+    {
+        // Every configured endpoint agreed the artifact does not exist. Remember
+        // that for a bounded window so repeated misses, such as Gradle probing a
+        // plugin marker that has no jar, stop walking the whole group.
+        let cache = config.cache.clone();
+        let negative_candidates = candidates.to_vec();
+        let incoming = incoming_headers.clone();
+        let stored_headers = headers.clone();
+        let ttl_secs = config.cache.negative_ttl_secs;
+        let _ = cache_work(true, move || {
+            for candidate in &negative_candidates {
                 write_disk_cache(
                     &cache,
-                    &candidate,
+                    candidate,
                     &incoming,
                     status,
                     &stored_headers,
-                    &stored_body,
+                    &[],
                     DiskCacheWriteOptions {
-                        head_only,
-                        ttl_secs: entry_ttl,
+                        head_only: false,
+                        ttl_secs: Some(ttl_secs),
                     },
-                )
-            })
-            .await;
-            return response_with_headers(status, &headers, Body::from(response_body));
-        }
-        if cacheable
-            && status == StatusCode::NOT_FOUND
-            && not_found_everywhere
-            && config.cache.negative_ttl_secs > 0
-        {
-            // Every configured endpoint agreed the artifact does not exist. Remember
-            // that for a bounded window so repeated misses, such as Gradle probing a
-            // plugin marker that has no jar, stop walking the whole group.
-            let cache = config.cache.clone();
-            let negative_candidates = candidates.clone();
-            let incoming = incoming_headers.clone();
-            let stored_headers = headers.clone();
-            let ttl_secs = config.cache.negative_ttl_secs;
-            let _ = cache_work(true, move || {
-                for candidate in &negative_candidates {
-                    write_disk_cache(
-                        &cache,
-                        candidate,
-                        &incoming,
-                        status,
-                        &stored_headers,
-                        &[],
-                        DiskCacheWriteOptions {
-                            head_only: false,
-                            ttl_secs: Some(ttl_secs),
-                        },
-                    );
-                }
-            })
-            .await;
-        }
-        let stream = upstream.bytes_stream().map_err(std::io::Error::other);
-        return response_with_headers(status, &headers, Body::from_stream(stream));
+                );
+            }
+        })
+        .await;
     }
-    unreachable!("every upstream request has at least one candidate")
+    let stream = upstream.bytes_stream().map_err(std::io::Error::other);
+    response_with_headers(status, &headers, Body::from_stream(stream))
+}
+
+/// Completes a request after the first endpoint failed over, choosing the racer
+/// that answered first and remembering a confirmed "not found" for the group.
+#[allow(clippy::too_many_arguments)]
+async fn forward_remaining_upstreams(
+    state: &AppState,
+    config: &crate::config::Config,
+    method: &Method,
+    candidates: &[Url],
+    remaining: &[Url],
+    incoming_headers: &HeaderMap,
+    cacheable: bool,
+    not_found_everywhere: bool,
+) -> Result<Response, ProxyError> {
+    let outcome = race_upstreams(state, config, method, remaining, incoming_headers).await;
+    if let Some((winner, response)) = outcome.winner {
+        return finish_upstream_response(
+            config,
+            method,
+            incoming_headers,
+            cacheable,
+            candidates,
+            &winner,
+            None,
+            response,
+            false,
+        )
+        .await;
+    }
+    if let Some((candidate, response)) = outcome.failure.or(outcome.not_found_fallback) {
+        return finish_upstream_response(
+            config,
+            method,
+            incoming_headers,
+            cacheable,
+            candidates,
+            &candidate,
+            None,
+            response,
+            not_found_everywhere && outcome.not_found_everywhere,
+        )
+        .await;
+    }
+    match outcome.last_error {
+        Some(error) => Err(error),
+        None => unreachable!("every raced upstream attempt returns a response or an error"),
+    }
 }
 
 pub async fn get_with_fallback(

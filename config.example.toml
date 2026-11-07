@@ -30,8 +30,10 @@ local_only = true
 
 [upstreams]
 # Every string field accepts one or more HTTP(S) endpoints separated by commas.
-# Safe requests try the next endpoint after transport errors, 404/408/429, or
-# 5xx responses. Protocol-success and authentication responses are preserved.
+# Safe requests try the first endpoint alone; once it reports a transport error,
+# 404/408/429, or 5xx response, the remaining endpoints are probed in parallel
+# and the first useful answer wins. Protocol-success and authentication
+# responses are preserved.
 # Redirects to a different destination are followed only after public-address
 # validation and DNS pinning. Private IP redirects stay within an explicitly
 # configured IP origin; redirects through an outbound proxy are restricted to
@@ -53,6 +55,10 @@ npm = "https://registry.npmjs.org"
 nvm = "https://nodejs.org/dist"
 opam = "https://opam.ocaml.org"
 go_proxy = "https://proxy.golang.org"
+# List distinct origins only. plugins.gradle.org/m2 redirects to
+# repo.maven.apache.org/maven2, so keeping both makes every missing artifact
+# probe Maven Central twice; the Aliyun gradle-plugin repository already mirrors
+# Gradle's plugin markers.
 maven = "https://maven-central.storage-download.googleapis.com/maven2"
 rubygems = "https://rubygems.org"
 rustup = "https://static.rust-lang.org"

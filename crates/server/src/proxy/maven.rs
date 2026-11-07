@@ -42,7 +42,10 @@ pub async fn proxy(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex};
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex,
+    };
 
     use axum::{
         body::to_bytes,
@@ -454,5 +457,123 @@ mod tests {
             .unwrap();
         let _ = std::fs::remove_dir_all(directory);
         upstream_task.abort();
+    }
+
+    async fn spawn_delayed_upstream(
+        delay: std::time::Duration,
+        status: StatusCode,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        let app = Router::new().fallback(any(move || async move {
+            tokio::time::sleep(delay).await;
+            (status, "slow")
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{address}/repository"), task)
+    }
+
+    #[tokio::test]
+    async fn unavailable_get_artifacts_are_remembered_once_every_upstream_agrees() {
+        let (primary, primary_requests, primary_task) =
+            spawn_upstream(StatusCode::NOT_FOUND, "missing").await;
+        let (fallback, fallback_requests, fallback_task) =
+            spawn_upstream(StatusCode::NOT_FOUND, "missing").await;
+        let (state, directory) = cached_state(format!("{primary},{fallback}")).await;
+        let path = "com/android/application/com.android.application.gradle.plugin/9.4.1/com.android.application.gradle.plugin-9.4.1.jar";
+
+        let first = request_artifact(&state, Method::GET, path).await;
+        assert_eq!(first.status(), StatusCode::NOT_FOUND);
+        assert_eq!(cache_status(&first), None);
+        let second = request_artifact(&state, Method::GET, path).await;
+        assert_eq!(second.status(), StatusCode::NOT_FOUND);
+        assert_eq!(cache_status(&second), Some("HIT"));
+        assert_eq!(primary_requests.lock().unwrap().len(), 1);
+        assert_eq!(fallback_requests.lock().unwrap().len(), 1);
+
+        crate::proxy::purge_cache(state.config().cache.clone())
+            .await
+            .unwrap();
+        let _ = std::fs::remove_dir_all(directory);
+        primary_task.abort();
+        fallback_task.abort();
+    }
+
+    #[tokio::test]
+    async fn slow_endpoints_do_not_serialize_the_remaining_upstreams() {
+        let (primary, _, primary_task) = spawn_upstream(StatusCode::NOT_FOUND, "missing").await;
+        let delay = std::time::Duration::from_millis(1200);
+        let (slow, slow_task) = spawn_delayed_upstream(delay, StatusCode::NOT_FOUND).await;
+        let (fallback, fallback_requests, fallback_task) =
+            spawn_upstream(StatusCode::OK, "artifact payload").await;
+        let (state, directory) = cached_state(format!("{primary},{slow},{fallback}")).await;
+        let path = "org/example/demo/1.0/demo-1.0.jar";
+
+        let started_at = std::time::Instant::now();
+        let response = request_artifact(&state, Method::GET, path).await;
+        let elapsed = started_at.elapsed();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            elapsed < std::time::Duration::from_millis(900),
+            "failover waited for the slow endpoint: {elapsed:?}"
+        );
+        assert_eq!(
+            to_bytes(response.into_body(), usize::MAX).await.unwrap(),
+            "artifact payload"
+        );
+        assert_eq!(fallback_requests.lock().unwrap().len(), 1);
+
+        crate::proxy::purge_cache(state.config().cache.clone())
+            .await
+            .unwrap();
+        let _ = std::fs::remove_dir_all(directory);
+        primary_task.abort();
+        slow_task.abort();
+        fallback_task.abort();
+    }
+
+    #[tokio::test]
+    async fn concurrent_requests_for_one_artifact_reach_the_upstream_once() {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let observed = requests.clone();
+        let app = Router::new().fallback(any(move || {
+            let observed = observed.clone();
+            async move {
+                observed.fetch_add(1, Ordering::SeqCst);
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                (StatusCode::OK, "artifact payload")
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let (state, directory) = cached_state(format!("http://{address}/repository")).await;
+        let path = "org/example/demo/1.0/demo-1.0.jar";
+
+        let (first, second) = tokio::join!(
+            request_artifact(&state, Method::GET, path),
+            request_artifact(&state, Method::GET, path),
+        );
+        assert_eq!(first.status(), StatusCode::OK);
+        assert_eq!(second.status(), StatusCode::OK);
+        assert_eq!(
+            to_bytes(first.into_body(), usize::MAX).await.unwrap(),
+            "artifact payload"
+        );
+        assert_eq!(
+            to_bytes(second.into_body(), usize::MAX).await.unwrap(),
+            "artifact payload"
+        );
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+
+        crate::proxy::purge_cache(state.config().cache.clone())
+            .await
+            .unwrap();
+        let _ = std::fs::remove_dir_all(directory);
+        server.abort();
     }
 }
