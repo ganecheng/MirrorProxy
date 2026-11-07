@@ -774,6 +774,10 @@ fn should_forward_response_header(name: &HeaderName) -> bool {
             | "keep-alive"
             | "proxy-authenticate"
             | "proxy-authorization"
+            // Upstream session cookies, including the bot-management cookies that
+            // Maven Central attaches to a 404, are never relayed to clients or
+            // replayed from the cache.
+            | "set-cookie"
             | "te"
             | "trailer"
             | "transfer-encoding"
@@ -1069,6 +1073,12 @@ mod tests {
             "baggage"
         )));
         assert!(should_forward_request_header(&header::ACCEPT));
+    }
+
+    #[test]
+    fn never_forwards_or_stores_upstream_session_cookies() {
+        assert!(!should_forward_response_header(&header::SET_COOKIE));
+        assert!(should_forward_response_header(&header::CONTENT_TYPE));
     }
 
     #[test]

@@ -196,7 +196,13 @@ pub(super) fn write_disk_cache(
     let Some((stored_at, expires_at)) = lifetime else {
         return;
     };
-    if headers.contains_key(header::SET_COOKIE) {
+    // A session cookie makes a response personal, so it stays out of the cache.
+    // A negative answer is only a "this artifact does not exist" marker with no
+    // body, and upstreams such as Maven Central answer 404 with a bot-management
+    // cookie; refusing those entries would walk the whole upstream group on every
+    // build. Cookies are never stored because response header filtering drops
+    // them.
+    if status != reqwest::StatusCode::NOT_FOUND && headers.contains_key(header::SET_COOKIE) {
         return;
     }
     // A body-less HEAD answer must never replace a cached response body.
@@ -526,5 +532,78 @@ mod tests {
         })
         .await
         .unwrap();
+    }
+
+    #[test]
+    fn negative_answers_with_an_upstream_cookie_are_remembered() {
+        let directory = std::env::temp_dir().join(format!(
+            "mirrorproxy-cache-negative-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let cache = CacheConfig {
+            enabled: true,
+            directory: directory.display().to_string(),
+            max_entry_mb: 1,
+            max_total_mb: 2,
+            ..CacheConfig::default()
+        };
+        let url = Url::parse("https://upstream.example/missing.pom").unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::SET_COOKIE,
+            HeaderValue::from_static("__cf_bm=token; Path=/"),
+        );
+
+        write_disk_cache(
+            &cache,
+            &url,
+            &HeaderMap::new(),
+            reqwest::StatusCode::NOT_FOUND,
+            &headers,
+            &[],
+            DiskCacheWriteOptions {
+                head_only: false,
+                ttl_secs: Some(3600),
+            },
+        );
+
+        let entry = load_disk_cache(&cache, &url, &HeaderMap::new()).expect("negative entry");
+        assert_eq!(entry.metadata.status, 404);
+        assert!(cached_header(&entry.metadata, "set-cookie").is_none());
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn personalized_answers_are_never_cached() {
+        let directory = std::env::temp_dir().join(format!(
+            "mirrorproxy-cache-cookie-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let cache = CacheConfig {
+            enabled: true,
+            directory: directory.display().to_string(),
+            max_entry_mb: 1,
+            max_total_mb: 2,
+            ..CacheConfig::default()
+        };
+        let url = Url::parse("https://upstream.example/session").unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::SET_COOKIE,
+            HeaderValue::from_static("session=private; Path=/"),
+        );
+
+        write_disk_cache(
+            &cache,
+            &url,
+            &HeaderMap::new(),
+            reqwest::StatusCode::OK,
+            &headers,
+            b"private payload",
+            DiskCacheWriteOptions::default(),
+        );
+
+        assert!(load_disk_cache(&cache, &url, &HeaderMap::new()).is_none());
+        let _ = fs::remove_dir_all(directory);
     }
 }

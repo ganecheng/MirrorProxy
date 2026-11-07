@@ -1500,6 +1500,9 @@ fn config_entries_include_public_and_quota_settings() {
         .any(|(key, value)| key == "cache.document_ttl_secs" && value == "86400"));
     assert!(entries
         .iter()
+        .any(|(key, value)| key == "cache.default_ttl_secs" && value == "86400"));
+    assert!(entries
+        .iter()
         .any(|(key, value)| key == "outbound_proxy.enabled" && value == "false"));
     assert!(entries
         .iter()

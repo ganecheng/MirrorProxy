@@ -299,6 +299,9 @@ pub struct CacheConfig {
     #[serde(default = "default_cache_max_total_mb")]
     pub max_total_mb: u64,
     /// Freshness used when an upstream does not provide an explicit cache TTL.
+    /// It defaults to a day so versioned artifacts, and the mutable indexes that
+    /// describe them, are served from disk instead of being revalidated on every
+    /// build. Lower it when a repository must surface new versions sooner.
     #[serde(default = "default_cache_default_ttl_secs")]
     pub default_ttl_secs: u64,
     /// Upper bound for an upstream supplied max-age/s-maxage value.
@@ -2726,7 +2729,7 @@ fn default_rate_limit_requests_per_minute() -> u32 {
 }
 
 fn default_cache_default_ttl_secs() -> u64 {
-    300
+    24 * 60 * 60
 }
 
 fn default_cache_max_ttl_secs() -> u64 {
@@ -3369,6 +3372,17 @@ insecure_skip_verify = true
             ..Config::default()
         };
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn keeps_cached_artifacts_for_a_day_by_default() {
+        let cache = CacheConfig::default();
+        let day = 24 * 60 * 60;
+        assert_eq!(cache.default_ttl_secs, day);
+        assert_eq!(cache.max_ttl_secs, day);
+        assert_eq!(cache.negative_ttl_secs, day);
+        assert_eq!(cache.head_ttl_secs, day);
+        assert_eq!(cache.document_ttl_secs, day);
     }
 
     #[test]

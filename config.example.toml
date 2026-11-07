@@ -151,16 +151,19 @@ enabled = false
 directory = "mirrorproxy-cache"
 max_entry_mb = 8
 max_total_mb = 256
-# Used only when the upstream omits an explicit public max-age. Mutable package
-# indexes are revalidated after this interval with ETag or Last-Modified.
-default_ttl_secs = 300
+# Used only when the upstream omits an explicit public max-age. A day keeps
+# versioned artifacts, and the mutable indexes that describe them, on disk for
+# the whole build cycle; a version published upstream can take that long to
+# appear here. Lower it when the mirror must surface new versions sooner.
+default_ttl_secs = 86400
 # Never trust an upstream cache lifetime longer than this local ceiling. It also
 # caps negative_ttl_secs, head_ttl_secs, and document_ttl_secs.
 max_ttl_secs = 86400
 # A cached answer is resolved across the whole upstream group first, so an
 # artifact served by a later endpoint is never re-probed through the earlier
 # ones. A "not found" answer is remembered only when every configured endpoint
-# agrees; 0 disables negative caching.
+# agrees; an upstream session or bot-management cookie does not prevent it.
+# 0 disables negative caching.
 negative_ttl_secs = 86400
 # HEAD answers are cached without a body and only answer another HEAD request.
 # 0 disables HEAD caching.

@@ -24,6 +24,11 @@ follow semantic versioning.
   same file, so `pub get` stops reporting `could not find package` for healthy
   packages.
 
+- Keep cached artifacts for a day by default, remember a confirmed "not found"
+  even when the upstream attaches a session or bot-management cookie, probe the
+  remaining upstreams in parallel after the first endpoint fails over, and
+  coalesce concurrent fetches of one artifact into a single upstream walk.
+
 ## [1.7.2] - 2026-11-02
 
 ### Release packages
