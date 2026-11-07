@@ -174,10 +174,11 @@ negative_ttl_secs = 86400
 # HEAD answers are cached without a body and only answer another HEAD request.
 # 0 disables HEAD caching.
 head_ttl_secs = 86400
-# Documents cached as published and rewritten per request, such as pub package
-# metadata JSON. Clients are told max-age=300, so this only controls how long the
-# mirror reuses its own copy; clear it from the admin cache controls after an
-# upstream publishes something you need immediately. 0 disables it.
+# Documents cached as published and rewritten per request: npm packuments, the
+# PyPI simple index, the NuGet service index and pub package metadata. Clients
+# are told max-age=300, so this only controls how long the mirror reuses its own
+# copy; clear it from the admin cache controls after an upstream publishes
+# something you need immediately. 0 disables it.
 document_ttl_secs = 86400
 
 # Offline ip2region XDB v3 databases. Missing or invalid files degrade regional

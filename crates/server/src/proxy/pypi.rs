@@ -1,7 +1,7 @@
 use axum::{
     body::Body,
     extract::{Path, State},
-    http::{header, HeaderMap, HeaderValue},
+    http::{header, HeaderMap, HeaderValue, StatusCode},
     response::Response,
 };
 
@@ -90,42 +90,36 @@ async fn proxy_simple_path(
         format!("/{clean_path}")
     };
     let url = upstream_url(&config.upstreams.pypi_simple, &upstream_path, query)?;
-    let response = proxy::get_with_fallback(&state, url).await?;
-    let status = response.status();
-    let content_type = response
-        .headers()
-        .get(header::CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or("")
-        .to_string();
-    let bytes = response.bytes().await?;
-
-    if status.is_success() && content_type.contains("html") {
-        let html = String::from_utf8_lossy(&bytes);
+    let headers = request
+        .as_ref()
+        .map(|req| req.headers())
+        .cloned()
+        .unwrap_or_default();
+    // The simple index is cached exactly as published and rewritten per request,
+    // because every file link must point at this instance.
+    let document = proxy::cached_document(&state, url.clone(), &headers).await?;
+    let document = document.filter(|entry| entry.content_type.contains("html"));
+    if let Some(document) = document {
+        let html = String::from_utf8_lossy(&document.body);
         let body = rewrite_file_links(&html, &public_base_url);
         return Response::builder()
-            .status(status)
+            .status(StatusCode::OK)
             .header(header::CACHE_CONTROL, super::metadata_cache_value())
             .header(header::VARY, super::metadata_vary_value())
             .header(
                 header::CONTENT_TYPE,
                 HeaderValue::from_static("text/html; charset=utf-8"),
             )
+            .header("x-mirrorproxy-cache", document.cache_status)
             .body(Body::from(body))
             .map_err(|_| ProxyError::InvalidHeader);
     }
 
-    let headers = request
-        .as_ref()
-        .map(|req| req.headers())
-        .cloned()
-        .unwrap_or_default();
     let method = request
         .as_ref()
         .map(|req| req.method().clone())
         .unwrap_or(axum::http::Method::GET);
-    let fallback_url = upstream_url(&config.upstreams.pypi_simple, &upstream_path, query)?;
-    proxy::forward(&state, method, fallback_url, &headers).await
+    proxy::forward(&state, method, url, &headers).await
 }
 
 fn upstream_url(base: &str, path: &str, query: Option<&str>) -> Result<reqwest::Url, ProxyError> {
@@ -164,6 +158,12 @@ fn rewrite_file_links(html: &str, public_base_url: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use axum::{body::to_bytes, http::Request, routing::any, Router};
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+
     use super::*;
 
     #[test]
@@ -228,5 +228,73 @@ mod tests {
             .as_str(),
             "https://mirror.example/python-files/packages/aa/pkg.whl"
         );
+    }
+
+    async fn pypi_test_state(upstream: String) -> (AppState, std::path::PathBuf) {
+        let directory = std::env::temp_dir().join(format!(
+            "mirrorproxy-pypi-document-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let mut config = crate::config::Config::default();
+        config.upstreams.pypi_simple = upstream;
+        config.cache.enabled = true;
+        config.cache.directory = directory.display().to_string();
+        config.cache.max_entry_mb = 1;
+        config.cache.max_total_mb = 8;
+        (crate::test_app_state(config).await, directory)
+    }
+
+    #[tokio::test]
+    async fn cached_simple_indexes_are_rewritten_for_every_request() {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let observed = requests.clone();
+        let upstream = Router::new().fallback(any(move || {
+            let observed = observed.clone();
+            async move {
+                observed.fetch_add(1, Ordering::SeqCst);
+                (
+                    [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+                    r#"<a href="https://files.pythonhosted.org/packages/aa/pkg.whl">pkg</a>"#,
+                )
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, upstream).await.unwrap();
+        });
+        let (state, directory) = pypi_test_state(format!("http://{address}")).await;
+
+        let mut cache_statuses = Vec::new();
+        for _ in 0..2 {
+            let response = simple(
+                State(state.clone()),
+                Path("requests/".to_string()),
+                Request::builder()
+                    .uri("/pypi/simple/requests/")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(response.status(), axum::http::StatusCode::OK);
+            cache_statuses.push(
+                response.headers()["x-mirrorproxy-cache"]
+                    .to_str()
+                    .unwrap()
+                    .to_string(),
+            );
+            let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            let html = String::from_utf8_lossy(&body);
+            assert!(html.contains("/pypi/files/packages/aa/pkg.whl"));
+        }
+        assert_eq!(cache_statuses, ["MISS", "HIT"]);
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+
+        crate::proxy::purge_cache(state.config().cache.clone())
+            .await
+            .unwrap();
+        let _ = std::fs::remove_dir_all(directory);
+        server.abort();
     }
 }

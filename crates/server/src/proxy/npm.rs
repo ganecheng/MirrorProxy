@@ -64,24 +64,19 @@ async fn proxy_npm_path(
         .unwrap_or_else(|| (Method::GET, HeaderMap::new(), None));
 
     if is_metadata_request(&clean_path) {
-        let response = proxy::get_with_fallback(&state, url).await?;
-        let status = response.status();
-        let is_json = response
-            .headers()
-            .get(header::CONTENT_TYPE)
-            .and_then(|value| value.to_str().ok())
-            .map(|content_type| content_type.contains("json"))
-            .unwrap_or(false);
-        let bytes = response.bytes().await?;
-
-        if status.is_success() && is_json {
-            return rewrite_json_response(status, bytes, &public_base_url);
+        // The packument is cached exactly as published and rewritten per request,
+        // because every tarball URL must point at this instance.
+        let document = proxy::cached_document(&state, url.clone(), &headers).await?;
+        let document = document.filter(|entry| entry.content_type.contains("json"));
+        if let Some(document) = document {
+            return rewrite_json_response(
+                reqwest::StatusCode::OK,
+                document.body,
+                &public_base_url,
+                document.cache_status,
+            );
         }
-
-        return Response::builder()
-            .status(status)
-            .body(Body::from(bytes))
-            .map_err(|_| ProxyError::InvalidHeader);
+        return forward_metadata(&state, url, &public_base_url).await;
     }
 
     if method == Method::POST {
@@ -124,10 +119,37 @@ fn sanitize_npm_path(path: &str) -> Result<String, ProxyError> {
     Ok(path.to_string())
 }
 
+/// Streams a document that could not be cached, rewriting it when it is JSON.
+async fn forward_metadata(
+    state: &AppState,
+    url: Url,
+    public_base_url: &str,
+) -> Result<Response, ProxyError> {
+    let response = proxy::get_with_fallback(state, url).await?;
+    let status = response.status();
+    let is_json = response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(|content_type| content_type.contains("json"))
+        .unwrap_or(false);
+    let bytes = response.bytes().await?;
+
+    if status.is_success() && is_json {
+        return rewrite_json_response(status, bytes, public_base_url, "MISS");
+    }
+
+    Response::builder()
+        .status(status)
+        .body(Body::from(bytes))
+        .map_err(|_| ProxyError::InvalidHeader)
+}
+
 fn rewrite_json_response(
     status: reqwest::StatusCode,
     bytes: Bytes,
     public_base_url: &str,
+    cache_status: &'static str,
 ) -> Result<Response, ProxyError> {
     let mut value: Value = serde_json::from_slice(&bytes).map_err(|_| ProxyError::InvalidUrl)?;
     rewrite_tarball_urls(&mut value, public_base_url);
@@ -141,6 +163,7 @@ fn rewrite_json_response(
             header::CONTENT_TYPE,
             HeaderValue::from_static("application/json"),
         )
+        .header("x-mirrorproxy-cache", cache_status)
         .body(Body::from(body))
         .map_err(|_| ProxyError::InvalidHeader)
 }
@@ -187,7 +210,17 @@ fn rewrite_npm_tarball(url: &str, public_base_url: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use axum::{body::to_bytes, http::Request, routing::post, Router};
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+
+    use axum::{
+        body::to_bytes,
+        http::Request,
+        routing::{any, post},
+        Router,
+    };
     use serde_json::json;
     use tower::ServiceExt;
 
@@ -267,5 +300,76 @@ mod tests {
             value["versions"]["1.0.0"]["dist"]["tarball"],
             "https://mirror.example/npm/react/-/react-1.0.0.tgz"
         );
+    }
+
+    async fn npm_test_state(upstream: String) -> (AppState, std::path::PathBuf) {
+        let directory = std::env::temp_dir().join(format!(
+            "mirrorproxy-npm-document-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let mut config = crate::config::Config::default();
+        config.upstreams.npm = upstream;
+        config.cache.enabled = true;
+        config.cache.directory = directory.display().to_string();
+        config.cache.max_entry_mb = 1;
+        config.cache.max_total_mb = 8;
+        (crate::test_app_state(config).await, directory)
+    }
+
+    #[tokio::test]
+    async fn cached_packuments_are_rewritten_for_every_request() {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let observed = requests.clone();
+        let upstream = Router::new().fallback(any(move || {
+            let observed = observed.clone();
+            async move {
+                observed.fetch_add(1, Ordering::SeqCst);
+                (
+                    [(header::CONTENT_TYPE, "application/json")],
+                    r#"{"versions":{"1.0.0":{"dist":{"tarball":"https://registry.npmjs.org/react/-/react-1.0.0.tgz"}}}}"#,
+                )
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, upstream).await.unwrap();
+        });
+        let (state, directory) = npm_test_state(format!("http://{address}")).await;
+
+        let mut cache_statuses = Vec::new();
+        for _ in 0..2 {
+            let response = proxy(
+                State(state.clone()),
+                Path("react".to_string()),
+                Request::builder()
+                    .uri("/npm/react")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(response.status(), axum::http::StatusCode::OK);
+            cache_statuses.push(
+                response.headers()["x-mirrorproxy-cache"]
+                    .to_str()
+                    .unwrap()
+                    .to_string(),
+            );
+            let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            let body: Value = serde_json::from_slice(&bytes).unwrap();
+            assert!(body["versions"]["1.0.0"]["dist"]["tarball"]
+                .as_str()
+                .unwrap()
+                .ends_with("/npm/react/-/react-1.0.0.tgz"));
+        }
+        assert_eq!(cache_statuses, ["MISS", "HIT"]);
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+
+        crate::proxy::purge_cache(state.config().cache.clone())
+            .await
+            .unwrap();
+        let _ = std::fs::remove_dir_all(directory);
+        server.abort();
     }
 }

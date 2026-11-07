@@ -29,6 +29,10 @@ follow semantic versioning.
   remaining upstreams in parallel after the first endpoint fails over, and
   coalesce concurrent fetches of one artifact into a single upstream walk.
 
+- Cache the npm packument, the PyPI simple index and the NuGet service index as
+  published and rewrite the embedded URLs per request, so those metadata reads
+  no longer reach the upstream on every install.
+
 ## [1.7.2] - 2026-11-02
 
 ### Release packages

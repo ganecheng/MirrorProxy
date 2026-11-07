@@ -1,7 +1,7 @@
 use axum::{
     body::Body,
     extract::{Path, State},
-    http::{header, HeaderValue},
+    http::{header, HeaderValue, StatusCode},
     response::Response,
 };
 use serde_json::Value;
@@ -37,34 +37,29 @@ pub async fn service_index(
     let upstream_path = "/v3/index.json";
     let upstream = proxy::select_upstream(&config.upstreams.nuget)?;
     let url = proxy::build_url(upstream, upstream_path, request.uri().query())?;
-    let response = proxy::get_with_fallback(&state, url).await?;
-    let status = response.status();
-    let content_type = response
-        .headers()
-        .get(header::CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or("")
-        .to_string();
-    let bytes = response.bytes().await?;
-
-    if status.is_success() && content_type.contains("json") {
-        let mut document: Value =
-            serde_json::from_slice(&bytes).map_err(|_| ProxyError::InvalidUrl)?;
+    // The service index is cached exactly as published and rewritten per request,
+    // because every resource URL must point at this instance.
+    let document = proxy::cached_document(&state, url, request.headers()).await?;
+    let document = document.filter(|entry| entry.content_type.contains("json"));
+    if let Some(document) = document {
+        let mut value: Value =
+            serde_json::from_slice(&document.body).map_err(|_| ProxyError::InvalidUrl)?;
         rewrite_upstream_urls(
-            &mut document,
+            &mut value,
             upstream,
             &state.public_base_url(request.headers()),
         );
         return Response::builder()
-            .status(status)
+            .status(StatusCode::OK)
             .header(header::CACHE_CONTROL, proxy::metadata_cache_value())
             .header(header::VARY, proxy::metadata_vary_value())
             .header(
                 header::CONTENT_TYPE,
                 HeaderValue::from_static("application/json; charset=utf-8"),
             )
+            .header("x-mirrorproxy-cache", document.cache_status)
             .body(Body::from(
-                serde_json::to_vec(&document).map_err(|_| ProxyError::InvalidUrl)?,
+                serde_json::to_vec(&value).map_err(|_| ProxyError::InvalidUrl)?,
             ))
             .map_err(|_| ProxyError::InvalidHeader);
     }
@@ -190,6 +185,12 @@ fn is_official_resource_host(host: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use axum::{body::to_bytes, http::Request, routing::any, Router};
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+
     use super::*;
 
     #[test]
@@ -258,5 +259,75 @@ mod tests {
             )
         );
         assert!(select_upstream("upstream/evil.example/query", "https://api.nuget.org").is_err());
+    }
+
+    async fn nuget_test_state(upstream: String) -> (AppState, std::path::PathBuf) {
+        let directory = std::env::temp_dir().join(format!(
+            "mirrorproxy-nuget-document-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let mut config = crate::config::Config::default();
+        config.upstreams.nuget = upstream;
+        config.cache.enabled = true;
+        config.cache.directory = directory.display().to_string();
+        config.cache.max_entry_mb = 1;
+        config.cache.max_total_mb = 8;
+        (crate::test_app_state(config).await, directory)
+    }
+
+    #[tokio::test]
+    async fn cached_service_index_is_rewritten_for_every_request() {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let observed = requests.clone();
+        let upstream = Router::new().fallback(any(move || {
+            let observed = observed.clone();
+            async move {
+                observed.fetch_add(1, Ordering::SeqCst);
+                (
+                    [(header::CONTENT_TYPE, "application/json")],
+                    r#"{"resources":[{"@id":"https://api.nuget.org/v3-flatcontainer/"}]}"#,
+                )
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, upstream).await.unwrap();
+        });
+        let (state, directory) = nuget_test_state(format!("http://{address}")).await;
+
+        let mut cache_statuses = Vec::new();
+        for _ in 0..2 {
+            let response = service_index(
+                State(state.clone()),
+                Request::builder()
+                    .uri("/nuget/v3/index.json")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(response.status(), axum::http::StatusCode::OK);
+            cache_statuses.push(
+                response.headers()["x-mirrorproxy-cache"]
+                    .to_str()
+                    .unwrap()
+                    .to_string(),
+            );
+            let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            let body: Value = serde_json::from_slice(&bytes).unwrap();
+            assert!(body["resources"][0]["@id"]
+                .as_str()
+                .unwrap()
+                .contains("/nuget/upstream/"));
+        }
+        assert_eq!(cache_statuses, ["MISS", "HIT"]);
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+
+        crate::proxy::purge_cache(state.config().cache.clone())
+            .await
+            .unwrap();
+        let _ = std::fs::remove_dir_all(directory);
+        server.abort();
     }
 }
